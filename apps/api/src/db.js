@@ -17,7 +17,9 @@ export function migrate(db) {
       email TEXT NOT NULL UNIQUE,
       password_hash TEXT NOT NULL,
       password_salt TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'owner',
       created_at TEXT NOT NULL
+      ,removed_at TEXT
     );
 
     CREATE TABLE IF NOT EXISTS assets (
@@ -119,10 +121,17 @@ export function migrate(db) {
       outbound_connection_threshold INTEGER NOT NULL DEFAULT 40, retained_days INTEGER NOT NULL DEFAULT 30,
       is_demo INTEGER NOT NULL DEFAULT 0,
       backend_addresses TEXT NOT NULL DEFAULT '[]'
+      ,config_version INTEGER NOT NULL DEFAULT 1
     );
     CREATE TABLE IF NOT EXISTS device_snapshots (
       device_id TEXT PRIMARY KEY REFERENCES device_agents(device_id) ON DELETE CASCADE,
       captured_at TEXT NOT NULL, processes_json TEXT NOT NULL, connections_json TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS device_config_updates (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, device_id TEXT NOT NULL REFERENCES device_agents(device_id) ON DELETE CASCADE,
+      version INTEGER NOT NULL, config_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+      attempts INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, last_attempt_at TEXT, applied_at TEXT, detail TEXT NOT NULL DEFAULT '',
+      UNIQUE(device_id,version)
     );
     CREATE TABLE IF NOT EXISTS firewall_rules (
       id TEXT PRIMARY KEY, device_id TEXT NOT NULL REFERENCES device_agents(device_id),
@@ -200,6 +209,9 @@ export function migrate(db) {
   addColumn(db, "assets", "address", "TEXT NOT NULL DEFAULT ''");
   addColumn(db, "assets", "description", "TEXT NOT NULL DEFAULT ''");
   addColumn(db, "assets", "upstream_url", "TEXT NOT NULL DEFAULT ''");
+  addColumn(db, "assets", "removed_at", "TEXT");
+  addColumn(db, "admins", "role", "TEXT NOT NULL DEFAULT 'owner'");
+  addColumn(db, "device_agents", "config_version", "INTEGER NOT NULL DEFAULT 1");
   addColumn(db, "alerts", "event_id", "INTEGER REFERENCES events(id) ON DELETE SET NULL");
   addColumn(db, "alerts", "device_id", "TEXT");
   addColumn(db, "device_agents", "health_detail", "TEXT NOT NULL DEFAULT ''");

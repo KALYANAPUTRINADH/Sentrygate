@@ -178,6 +178,12 @@ The command creates a suggestion-only policy and proposed action for the generat
 npm run demo:firewall
 ```
 
+To run the complete incident-policy proposal → approval → rollback flow in an isolated in-memory API and database, without touching the dashboard database, run:
+
+```powershell
+npm run demo:actions
+```
+
 Do not approve a device-target action on a real computer unless you administer it and have reviewed its exact IP, port, and expiry. Keep automatic blocking disabled.
 
 ## Tests and checks

@@ -35,7 +35,21 @@ async function route(req, res, db, config) {
     if (!device || !safeTokenMatches(token, device.credential_hash)) return json(res, 401, { error: "Valid device credential required" });
     expireFirewallRules(db);
     const rules = db.prepare("SELECT * FROM firewall_rules WHERE device_id=? AND status IN ('approved','active','failed','removing','expired')").all(deviceConfig[1]).map(firewallRuleForAgent);
-    return json(res, 200, { ...deviceSettingsFor(device), firewallRules: rules });
+    const update = db.prepare("SELECT version,config_json FROM device_config_updates WHERE device_id=? AND status IN ('pending','failed') ORDER BY version DESC LIMIT 1").get(device.device_id);
+    if (update) db.prepare("UPDATE device_config_updates SET status='pending',attempts=attempts+1,last_attempt_at=?,detail='' WHERE device_id=? AND version=?").run(new Date().toISOString(), device.device_id, update.version);
+    return json(res, 200, { ...deviceSettingsFor(device), ...(update ? JSON.parse(update.config_json) : {}), configVersion: update?.version ?? device.config_version, firewallRules: rules });
+  }
+  const configAck = url.pathname.match(/^\/api\/devices\/([0-9a-f-]{36})\/config\/ack$/i);
+  if (configAck && req.method === "POST") {
+    const deviceId = configAck[1], token = /^Bearer\s+(.+)$/i.exec(req.headers.authorization ?? "")?.[1] ?? "";
+    const device = db.prepare("SELECT * FROM device_agents WHERE device_id=? AND revoked_at IS NULL AND is_demo=0").get(deviceId);
+    if (!device || !safeTokenMatches(token, device.credential_hash)) return json(res, 401, { error: "Valid device credential required" });
+    const body = await readJson(req);
+    if (!Number.isInteger(body.version) || !["applied", "failed"].includes(body.status) || typeof body.detail !== "string" || body.detail.length > 1000) return json(res, 400, { error: "Invalid configuration acknowledgement" });
+    const result = db.prepare("UPDATE device_config_updates SET status=?,detail=?,applied_at=CASE WHEN ?='applied' THEN ? ELSE applied_at END WHERE device_id=? AND version=? AND status IN ('pending','failed')")
+      .run(body.status, body.detail, body.status, new Date().toISOString(), deviceId, body.version);
+    if (result.changes) recordAudit(db, `device:${deviceId}`, `device.config_${body.status}`, `device:${deviceId}`, `Configuration version ${body.version}: ${body.detail || body.status}.`);
+    return json(res, 200, { accepted: true, updated: Boolean(result.changes) });
   }
   const firewallState = url.pathname.match(/^\/api\/devices\/([0-9a-f-]{36})\/firewall\/state$/i);
   if (firewallState && req.method === "POST") {
@@ -214,6 +228,10 @@ async function route(req, res, db, config) {
   if (url.pathname.startsWith("/api/") && !admin) {
     return json(res, 401, { error: "Authentication required" });
   }
+  if (url.pathname.startsWith("/api/") && admin.role !== "owner") {
+    const analystWrite = admin.role === "security_analyst" && ((req.method === "POST" && /^\/api\/incidents\/[a-f0-9-]+\/notes$/.test(url.pathname)) || (req.method === "PATCH" && /^\/api\/incidents\/[a-f0-9-]+\/status$/.test(url.pathname)) || (req.method === "POST" && url.pathname === "/api/action-policies"));
+    if (!(["GET", "HEAD"].includes(req.method)) && !analystWrite) return json(res, 403, { error: "This administrator role cannot perform that action" });
+  }
 
   if (url.pathname === "/api/actions/settings" && req.method === "GET") {
     const setting = db.prepare("SELECT emergency_paused AS emergencyPaused,updated_at AS updatedAt FROM action_settings WHERE id=1").get();
@@ -238,7 +256,7 @@ async function route(req, res, db, config) {
     if (invalid) return json(res, 400, { error: invalid });
     const id = crypto.randomUUID(), now = new Date().toISOString();
     db.prepare(`INSERT INTO action_policies (id,name,enabled,mode,asset_id,detection_rule,minimum_severity,minimum_event_count,window_minutes,target_type,target_id,protocol,local_port,duration_minutes,created_by,created_at,updated_at)
-      VALUES (?,?,1,'suggestion-only',?,?,?,?,?,?,?,?,?,?,?, ?,?)`).run(id, body.name.trim(), body.assetId, body.detectionRule || "*", body.minimumSeverity, body.minimumEventCount, body.windowMinutes, body.targetType, String(body.targetId), body.protocol, body.localPort, body.durationMinutes, admin.email, now, now);
+      VALUES (?,?,1,'suggestion-only',?,?,?,?,?,?,?,?,?,?,?, ?,?)`).run(id, body.name.trim(), body.assetId, body.detectionRule || "*", body.minimumSeverity, body.minimumEventCount, body.windowMinutes, body.targetType, String(body.targetId), body.targetType === "device" ? body.protocol : "TCP", body.targetType === "device" ? body.localPort : 443, body.durationMinutes, admin.email, now, now);
     recordAudit(db, admin.email, "action.policy_created", `policy:${id}`, `Created suggestion-only policy ${body.name.trim()} for asset ${body.assetId}; automatic blocking disabled.`);
     const incidents = db.prepare("SELECT id FROM incidents WHERE asset_id=? AND status IN ('open','investigating')").all(body.assetId);
     for (const incident of incidents) evaluateIncidentPolicies(db, incident.id);
