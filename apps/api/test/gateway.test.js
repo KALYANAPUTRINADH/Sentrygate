@@ -23,6 +23,7 @@ let upstreamHits;
 
 beforeEach(async () => {
   config = loadConfig({ dbPath: path.join(os.tmpdir(), `sentrygate-gateway-${randomUUID()}.db`), sessionSecret: "gateway-test-session-secret-with-32-characters", host: "127.0.0.1", gatewayHost: "127.0.0.1", port: 0, gatewayPort: 0, webRoot: path.resolve("apps/web") });
+  config.eventIngestTimeoutMs=150;
   db = openDatabase(config.dbPath);
   ensureAgentCredential(db, config.sessionSecret);
   upstreamHits = 0;
@@ -61,10 +62,10 @@ function closeServer(server) {
   return new Promise((resolve) => server.close(() => resolve()));
 }
 
-function setProtection({ mode = "observe", enabled = true, rateLimitCount = 120, windowSeconds = 60, allowlist = [], upstreamUrl: upstreamAddress = upstreamUrl, sensitivePathsEnabled = true } = {}) {
+function setProtection({ mode = "observe", failureMode="open", enabled = true, rateLimitCount = 120, windowSeconds = 60, allowlist = [], upstreamUrl: upstreamAddress = upstreamUrl, sensitivePathsEnabled = true } = {}) {
   db.prepare("UPDATE assets SET upstream_url = ? WHERE id = ?").run(upstreamAddress, assetId);
-  db.prepare(`UPDATE gateway_rules SET enabled=?,mode=?,rate_limit_count=?,window_seconds=?,sensitive_paths_enabled=?,updated_at=? WHERE asset_id=?`)
-    .run(enabled ? 1 : 0, mode, rateLimitCount, windowSeconds, sensitivePathsEnabled ? 1 : 0, new Date().toISOString(), assetId);
+  db.prepare(`UPDATE gateway_rules SET enabled=?,mode=?,failure_mode=?,rate_limit_count=?,window_seconds=?,sensitive_paths_enabled=?,updated_at=? WHERE asset_id=?`)
+    .run(enabled ? 1 : 0, mode, failureMode, rateLimitCount, windowSeconds, sensitivePathsEnabled ? 1 : 0, new Date().toISOString(), assetId);
   db.prepare("DELETE FROM gateway_allowlist WHERE asset_id = ?").run(assetId);
   for (const ip of allowlist) db.prepare("INSERT INTO gateway_allowlist (asset_id,ip,created_at) VALUES (?,?,?)").run(assetId, ip, new Date().toISOString());
 }
@@ -95,6 +96,10 @@ test("forwards normal requests and streams uploads while recording request evide
   assert.equal(upload.status, 200);
   assert.equal((await upload.json()).bytes, bytes.length);
   await waitForEvents(2);
+  for(let i=0;i<20&&db.prepare("SELECT COUNT(*) AS count FROM gateway_request_metrics WHERE asset_id=?").get(assetId).count<2;i++)await new Promise(resolve=>setTimeout(resolve,10));
+  const metrics=db.prepare("SELECT COUNT(*) AS count,MAX(duration_ms) AS maxDuration FROM gateway_request_metrics WHERE asset_id=?").get(assetId);
+  assert.equal(metrics.count,2);
+  assert.ok(metrics.maxDuration>=0);
   const event = db.prepare("SELECT * FROM events WHERE request_path = ? ORDER BY id DESC LIMIT 1").get("/site/" + assetId + "/upload");
   assert.equal(event.method, "POST");
   assert.equal(event.user_agent, "upload-test-agent");
@@ -213,6 +218,19 @@ test("returns 501 and records unsupported WebSocket upgrade attempts", async () 
   assert.equal(event.detection_rule, "websocket_unsupported");
   assert.equal(event.response_status, 501);
   assert.equal(event.action, "unsupported");
+});
+
+test("enforcement telemetry outage follows the website's configured fail-open or fail-closed behavior", async () => {
+  config.apiBaseUrl="http://127.0.0.1:1";
+  setProtection({mode:"block",failureMode:"open"});
+  const hits=upstreamHits;
+  const open=await request("/.env");
+  assert.equal(open.status,200);
+  assert.equal(upstreamHits,hits+1);
+  setProtection({mode:"block",failureMode:"closed"});
+  const closed=await request("/.env");
+  assert.equal(closed.status,503);
+  assert.equal(upstreamHits,hits+1);
 });
 
 test("reports unavailable upstream with 502 and event evidence", async () => {

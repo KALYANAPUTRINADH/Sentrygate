@@ -2,7 +2,7 @@ import { escapeHtml } from "./escape.js";
 import { renderIncidentEvidence } from "./incident-render.js";
 
 const app = document.querySelector("#app");
-const state = { session: null, data: null, page: "overview", error: "", alert: null, incident: null, protection: null, device: null, firewallPreview: null, firewallManagement: [], newAgentCredential: "", newDeviceCredential: null };
+const state = { session: null, data: null, page: "overview", error: "", alert: null, incident: null, assetDetail: null, protection: null, device: null, firewallPreview: null, firewallManagement: [], newAgentCredential: "", newDeviceCredential: null };
 
 async function api(path, options = {}) {
   const response = await fetch(path, { credentials: "include", headers: { "Content-Type": "application/json", ...(options.headers ?? {}) }, ...options });
@@ -16,10 +16,10 @@ async function api(path, options = {}) {
 async function refresh() {
   state.session = await api("/api/session");
   if (state.session.authenticated) {
-    const [summary, assets, alerts, events, auditLog, gatewaySettings, devices, firewallRules, firewallManagement, incidentSettings, incidents, actionPolicies, actions, actionSettings] = await Promise.all([
-      api("/api/summary"), api("/api/assets"), api("/api/alerts"), api("/api/events"), api("/api/audit-log"), api("/api/gateway/settings"), api("/api/devices"), api("/api/firewall/rules"), api("/api/firewall/settings"), api("/api/incidents/settings"), api("/api/incidents"), api("/api/action-policies"), api("/api/actions"), api("/api/actions/settings")
+    const [summary, assets, alerts, events, auditLog, gatewaySettings, devices, firewallRules, firewallManagement, incidentSettings, incidents, actionPolicies, actions, actionSettings, pilot] = await Promise.all([
+      api("/api/summary"), api("/api/assets"), api("/api/alerts"), api("/api/events"), api("/api/audit-log"), api("/api/gateway/settings"), api("/api/devices"), api("/api/firewall/rules"), api("/api/firewall/settings"), api("/api/incidents/settings"), api("/api/incidents"), api("/api/action-policies"), api("/api/actions"), api("/api/actions/settings"), api("/api/pilot/metrics?days=7")
     ]);
-    state.data = { summary, assets, alerts, events, auditLog, gatewaySettings, devices, firewallRules, incidentSettings, incidents, actionPolicies, actions, actionSettings };
+    state.data = { summary, assets, alerts, events, auditLog, gatewaySettings, devices, firewallRules, incidentSettings, incidents, actionPolicies, actions, actionSettings, pilot };
     state.firewallManagement = firewallManagement;
     state.error = "";
   }
@@ -30,7 +30,7 @@ function render() {
   if (!state.session) { app.innerHTML = '<div class="loading">Loading SentryGate...</div>'; return; }
   if (!state.session.authenticated) { renderAuth(); return; }
   const { summary, assets, alerts, events, auditLog, devices } = state.data;
-  const pages = ["overview", "assets", "devices", "firewall", "investigation", "actions", "alerts", "events", "settings"];
+  const pages = ["overview", "pilot", "assets", "devices", "firewall", "investigation", "actions", "alerts", "events", "settings"];
   app.innerHTML = `
     <aside class="sidebar">
       <a class="brand" href="#overview"><span class="brand-mark">S</span><span>SentryGate<small>SECURITY OPERATIONS</small></span></a>
@@ -38,14 +38,17 @@ function render() {
       <div class="sidebar-bottom"><span class="connection-dot"></span> Local system <button id="logout" class="icon-button" title="Sign out" aria-label="Sign out">↩</button></div>
     </aside>
     <main class="main-area">
-      <header class="page-header"><div><p class="eyebrow">SENTRYGATE / ${pageLabel(state.page).toUpperCase()}</p><h1>${pageTitle(state.page)}</h1></div><div class="user-menu"><span class="avatar">${escapeHtml(state.session.admin.email.slice(0, 1).toUpperCase())}</span><span>${escapeHtml(state.session.admin.email)}</span></div></header>
-      <div class="page-content">${state.error ? `<p class="notice">${escapeHtml(state.error)}</p>` : ""}${pageContent({ summary, assets, alerts, events, auditLog, gatewaySettings: state.data.gatewaySettings, devices, incidents: state.data.incidents, incidentSettings: state.data.incidentSettings })}</div>
+      <header class="page-header"><div><p class="eyebrow">SENTRYGATE / ${pageLabel(state.page).toUpperCase()}</p><h1>${pageTitle(state.page)}</h1></div><div class="user-menu"><span class="avatar">${escapeHtml(state.session.admin.email.slice(0, 1).toUpperCase())}</span><span>${escapeHtml(state.session.admin.email)} · ${escapeHtml(state.session.admin.role.replaceAll("_", " "))}</span></div></header>
+      <div class="page-content">${state.error ? `<p class="notice">${escapeHtml(state.error)}</p>` : ""}${pageContent({ summary, assets, alerts, events, auditLog, gatewaySettings: state.data.gatewaySettings, devices, incidents: state.data.incidents, incidentSettings: state.data.incidentSettings, pilot: state.data.pilot })}</div>
     </main>`;
-  document.querySelectorAll("[data-page]").forEach((button) => button.addEventListener("click", async () => { state.page = button.dataset.page; state.alert = null; state.incident = null; state.device = null; state.protection = null; state.firewallPreview = null; if (["overview", "devices", "firewall", "investigation", "actions", "events", "alerts"].includes(state.page)) await refresh(); else render(); }));
+  document.querySelectorAll("[data-page]").forEach((button) => button.addEventListener("click", async () => { state.page = button.dataset.page; state.alert = null; state.incident = null; state.device = null; state.protection = null; state.firewallPreview = null; if (["overview", "pilot", "devices", "firewall", "investigation", "actions", "events", "alerts"].includes(state.page)) await refresh(); else render(); }));
   document.querySelector("#logout").addEventListener("click", async () => { await api("/api/logout", { method: "POST" }); state.session = null; await refresh(); });
   document.querySelector("#asset-form")?.addEventListener("submit", createAsset);
   document.querySelectorAll("[data-alert]").forEach((button) => button.addEventListener("click", () => openAlert(button.dataset.alert)));
   document.querySelectorAll("[data-device]").forEach((button) => button.addEventListener("click", () => openDevice(button.dataset.device)));
+  document.querySelectorAll("[data-asset]").forEach((button) => button.addEventListener("click", () => openAsset(button.dataset.asset)));
+  document.querySelector("#back-assets")?.addEventListener("click", () => { state.assetDetail = null; render(); });
+  document.querySelector("#remove-asset")?.addEventListener("click", removeAsset);
   document.querySelector("#event-filter")?.addEventListener("submit", filterEvents);
   document.querySelector("#alert-filter")?.addEventListener("submit", filterAlerts);
   document.querySelector("#reset-filters")?.addEventListener("click", async () => { document.querySelector("#event-filter").reset(); await loadEvents(); });
@@ -79,15 +82,19 @@ function render() {
   document.querySelectorAll("[data-action-approve]").forEach((button) => button.addEventListener("click", () => approveAction(button.dataset.actionApprove)));
   document.querySelectorAll("[data-action-rollback]").forEach((button) => button.addEventListener("click", () => rollbackAction(button.dataset.actionRollback)));
   document.querySelectorAll("[data-policy-toggle]").forEach((button) => button.addEventListener("click", () => toggleActionPolicy(button.dataset.policyToggle, button.dataset.enabled === "true")));
+  document.querySelectorAll("[data-false-positive]").forEach((button) => button.addEventListener("click", () => reviewFalsePositive(button.dataset.falsePositive, button.dataset.marked !== "true")));
+  document.querySelector("#pilot-report")?.addEventListener("click", downloadPilotReport);
 }
 
 function pageContent(data) {
   if (state.alert) return alertDetail(state.alert);
   if (state.incident) return incidentInvestigationDetail(state.incident);
+  if (state.assetDetail) return assetInvestigationDetail(state.assetDetail);
   if (state.page === "devices") return devicesPage(data.devices);
   if (state.page === "firewall") return firewallPage(data.firewallRules, data.devices, data.incidents);
   if (state.page === "investigation") return investigationPage(data.incidents, data.assets, data.devices);
   if (state.page === "actions") return actionsPage(data.actions, data.actionPolicies, data.actionSettings, data.assets, data.devices);
+  if (state.page === "pilot") return pilotPage(data.pilot, data.assets);
   if (state.page === "overview") return overview(data);
   if (state.page === "assets") return assetsPage(data.assets);
   if (state.page === "alerts") return alertsPage(data.alerts);
@@ -101,6 +108,13 @@ function overview({ summary, assets, alerts, events, incidents }) {
     <section class="section-block"><div class="section-heading"><div><p class="eyebrow">NEEDS REVIEW</p><h2>Recent alerts</h2></div><button class="text-button" data-page="alerts">View all <span>→</span></button></div>${alertList(alerts.slice(0, 4))}</section></section>
     <section class="section-block"><div class="section-heading"><div><p class="eyebrow">CORRELATED ACTIVITY</p><h2>Recent incidents</h2></div><button class="text-button" data-page="investigation">Investigate <span>→</span></button></div>${incidentTable((incidents ?? []).slice(0, 5))}</section>
     <section class="section-block"><div class="section-heading"><div><p class="eyebrow">LATEST ACTIVITY</p><h2>Event history</h2></div><button class="text-button" data-page="events">View events <span>→</span></button></div>${eventTable(events.slice(0, 6))}</section>`;
+}
+
+function pilotPage(pilot,assets){
+  const m=pilot.metrics;
+  const agent=m.agent;
+  const sites=assets.filter(a=>a.type==="website");
+  return `<section class="section-block"><div class="section-heading"><div><p class="eyebrow">CONTROLLED ACTIVATION</p><h2>Seven-day pilot measurements</h2></div><button id="pilot-report" class="quiet-button">Export JSON report</button></div><p class="subtle">Window starts ${escapeHtml(new Date(m.since).toLocaleString())}. Request duration includes upload, upstream wait, and response streaming.</p><div class="metrics pilot-metrics">${metric("Requests",m.requests,"green","⌁")}${metric("Alerts",m.alerts,"amber","!")}${metric("Reviewed false positives",m.falsePositives,"red","×")}${metric("Upstream errors",m.upstreamErrors,"blue","↗")}</div><dl class="facts pilot-facts"><dt>Gateway-observed duration</dt><dd>${m.gatewayLatencyMs.p50??"—"} ms p50 · ${m.gatewayLatencyMs.p95??"—"} ms p95 · ${m.gatewayLatencyMs.p99??"—"} ms p99 (${m.gatewayLatencyMs.sampleCount} samples)</dd><dt>Gateway events</dt><dd>${m.eventRecords} recorded · ${m.detections} detections reviewed</dd><dt>False-positive review rate</dt><dd>${(m.falsePositiveRate*100).toFixed(1)}% of detections</dd><dt>Windows agent</dt><dd>${agent?`${escapeHtml(agent.name)} · ${agent.healthy?"healthy":"needs review"} · last heartbeat ${agent.lastHeartbeat?escapeHtml(new Date(agent.lastHeartbeat).toLocaleString()):"not received"} · ${escapeHtml(agent.version)}`:"No non-demo enrolled device is reporting."}</dd></dl></section><section class="section-block"><div class="section-heading"><div><p class="eyebrow">SAFE CONFIGURATION</p><h2>Activation guardrails</h2></div></div><div class="table-wrap"><table><thead><tr><th>Website</th><th>Upstream</th><th>Gateway</th><th>Rule state</th><th>Failure behavior</th></tr></thead><tbody>${sites.length?sites.map(s=>{const p=pilot.websitePolicies.find(x=>x.id===s.id);return `<tr><td>${escapeHtml(s.name)}</td><td class="mono">${escapeHtml(s.address)}</td><td>${escapeHtml(p?.healthStatus||s.connectionStatus)}</td><td>${p?`${p.enabled?"enabled":"disabled"} · ${escapeHtml(p.mode)}`:"not configured"}</td><td>${p?escapeHtml(p.failureMode):"—"}</td></tr>`}).join(""):`<tr><td colspan="5">No website assets registered.</td></tr>`}</tbody></table></div><p class="subtle">Firewall controls require administrator approval; automatic blocking is disabled.</p><p class="pilot-recommendation"><strong>Recommendation: ${escapeHtml(pilot.recommendation.toUpperCase())}</strong> · ${escapeHtml(pilot.recommendationReason)}</p></section><section class="section-block"><div class="section-heading"><div><p class="eyebrow">STAGED GATES</p><h2>Local → staging → one approved live website</h2></div></div><ol class="pilot-gates"><li>Local sample only: observe mode; run <code>npm run pilot:simulate -- --asset-id &lt;local-website-id&gt;</code>.</li><li>Staging website: verify TLS, upstream health, event delivery, backup restore, and rollback rehearsal.</li><li>Live activation: operator-approved change window only; review fail behavior and routing rollback first. This dashboard does not change DNS or approve firewall changes.</li></ol></section>`;
 }
 
 function assetsPage(assets) {
@@ -162,7 +176,7 @@ function simpleTable(headers, rows) { return rows.length ? `<div class="table-wr
 
 function protectionPanel(asset, settings) {
   const rule = settings.rule;
-  return `<section class="section-block"><div class="section-heading"><div><p class="eyebrow">WEBSITE GATEWAY</p><h2>${escapeHtml(asset.name)} protection</h2></div><span class="subtle">Requests use /site/${asset.id}/</span></div><form id="protection-form" class="protection-form"><label class="wide">Upstream URL<input name="upstreamUrl" type="url" required maxlength="2048" value="${escapeHtml(settings.upstreamUrl)}" placeholder="http://127.0.0.1:4320"></label><label class="toggle-row"><input name="enabled" type="checkbox" ${Number(rule.enabled) ? "checked" : ""}>Enable gateway rules</label><label>Rule mode<select name="mode"><option value="observe" ${rule.mode === "observe" ? "selected" : ""}>Observe</option><option value="challenge-ready" ${rule.mode === "challenge-ready" ? "selected" : ""}>Challenge-ready placeholder</option><option value="block" ${rule.mode === "block" ? "selected" : ""}>Block</option></select></label><label>Requests per IP<input type="number" name="rateLimitCount" min="1" max="100000" value="${rule.rateLimitCount}"></label><label>Window seconds<input type="number" name="windowSeconds" min="1" max="3600" value="${rule.windowSeconds}"></label><label class="toggle-row"><input name="sensitivePathsEnabled" type="checkbox" ${Number(rule.sensitivePathsEnabled) ? "checked" : ""}>Detect /.env and /.git paths</label><label class="wide">Allowlisted IP addresses<textarea name="allowlist" rows="3" placeholder="One exact IP address per line">${escapeHtml(settings.allowlist.join("\n"))}</textarea></label><small class="wide">Allowlisted addresses bypass path and rate rules. Use exact IPv4 or IPv6 addresses.</small><p id="protection-error" class="form-error wide"></p><div class="form-actions wide"><button class="primary-button">Save protection settings</button><button type="button" id="close-protection" class="quiet-button">Close</button></div></form></section>`;
+  return `<section class="section-block"><div class="section-heading"><div><p class="eyebrow">WEBSITE GATEWAY</p><h2>${escapeHtml(asset.name)} protection</h2></div><span class="subtle">Requests use /site/${asset.id}/</span></div><form id="protection-form" class="protection-form"><label class="wide">Upstream URL<input name="upstreamUrl" type="url" required maxlength="2048" value="${escapeHtml(settings.upstreamUrl)}" placeholder="http://127.0.0.1:4320"></label><label class="toggle-row"><input name="enabled" type="checkbox" ${Number(rule.enabled) ? "checked" : ""}>Enable gateway rules</label><label>Rule mode<select name="mode"><option value="observe" ${rule.mode === "observe" ? "selected" : ""}>Observe</option><option value="challenge-ready" ${rule.mode === "challenge-ready" ? "selected" : ""}>Challenge-ready placeholder</option><option value="block" ${rule.mode === "block" ? "selected" : ""}>Block</option></select></label><label>On enforcement telemetry failure<select name="failureMode"><option value="open" ${(rule.failureMode || "open") === "open" ? "selected" : ""}>Fail open · forward request</option><option value="closed" ${rule.failureMode === "closed" ? "selected" : ""}>Fail closed · return 503</option></select></label><label>Requests per IP<input type="number" name="rateLimitCount" min="1" max="100000" value="${rule.rateLimitCount}"></label><label>Window seconds<input type="number" name="windowSeconds" min="1" max="3600" value="${rule.windowSeconds}"></label><label class="toggle-row"><input name="sensitivePathsEnabled" type="checkbox" ${Number(rule.sensitivePathsEnabled) ? "checked" : ""}>Detect /.env and /.git paths</label><label class="wide">Allowlisted IP addresses<textarea name="allowlist" rows="3" placeholder="One exact IP address per line">${escapeHtml(settings.allowlist.join("\n"))}</textarea></label><small class="wide">Allowlisted addresses bypass path and rate rules. Use exact IPv4 or IPv6 addresses.</small><p id="protection-error" class="form-error wide"></p><div class="form-actions wide"><button class="primary-button">Save protection settings</button><button type="button" id="close-protection" class="quiet-button">Close</button></div></form></section>`;
 }
 
 function eventsPage(events, assets, devices) {
@@ -194,7 +208,7 @@ function alertDetail(alert) {
 function metric(label, value, tone, icon) { return `<article class="metric"><span class="metric-icon ${tone}">${icon}</span><span class="metric-label">${label}</span><strong>${value}</strong></article>`; }
 function assetTable(assets, showActions = false) {
   if (!assets.length) return emptyState("No assets registered yet.");
-  return `<div class="table-wrap"><table><thead><tr><th>Asset</th><th>Type</th><th>Address</th><th>Description</th><th>Status</th>${showActions ? "<th>Gateway</th>" : ""}</tr></thead><tbody>${assets.map((a) => `<tr><td><strong>${escapeHtml(a.name)}</strong></td><td>${escapeHtml(a.type)}</td><td class="mono">${escapeHtml(a.address)}</td><td>${escapeHtml(a.description || "—")}</td><td><span class="status ${escapeHtml(a.status)}">${escapeHtml(a.status)}</span></td>${showActions ? `<td>${a.type === "website" ? `<button class="quiet-button compact" data-protection="${a.id}">Configure</button>` : "—"}</td>` : ""}</tr>`).join("")}</tbody></table></div>`;
+  return `<div class="table-wrap"><table><thead><tr><th>Asset</th><th>Type</th><th>Address</th><th>Description</th><th>Connection</th><th>Heartbeat / version</th>${showActions ? "<th>Manage</th>" : ""}</tr></thead><tbody>${assets.map((a) => `<tr><td><button class="text-button" data-asset="${a.id}"><strong>${escapeHtml(a.name)}</strong></button></td><td>${escapeHtml(a.type)}</td><td class="mono">${escapeHtml(a.address)}</td><td>${escapeHtml(a.description || "—")}</td><td><span class="status ${a.connectionStatus === "healthy" || a.connectionStatus === "configured" ? "healthy" : "watch"}">${escapeHtml(a.connectionStatus || a.status)}</span></td><td>${a.lastHeartbeat ? new Date(a.lastHeartbeat).toLocaleString() : "—"}<small class="cell-sub">${escapeHtml(a.version || "")}</small></td>${showActions ? `<td>${a.type === "website" ? `<button class="quiet-button compact" data-protection="${a.id}">Configure</button>` : "—"}</td>` : ""}</tr>`).join("")}</tbody></table></div>`;
 }
 function alertList(alerts) {
   if (!alerts.length) return emptyState("No alerts to review.");
@@ -202,13 +216,21 @@ function alertList(alerts) {
 }
 function eventTable(events) {
   if (!events.length) return emptyState("No events match these filters.");
-  return `<div class="table-wrap"><table><thead><tr><th>Time</th><th>Asset / device</th><th>Source IP</th><th>Request / process</th><th>Response</th><th>Rule / reason</th><th>Action</th></tr></thead><tbody>${events.map((event) => `<tr><td>${new Date(event.createdAt).toLocaleString()}</td><td>${escapeHtml(event.deviceName || event.assetName || event.assetId || "—")}</td><td class="mono">${escapeHtml(event.observedSourceIp || "—")}</td><td><strong>${escapeHtml(event.method || event.source)}</strong><small class="cell-sub mono">${escapeHtml(event.path || event.requestDetails || event.processDetails || event.category)}</small><small class="cell-sub">${escapeHtml(event.userAgent || "")}</small></td><td>${event.responseStatus || "—"}</td><td><strong>${escapeHtml(event.detectionRule || "none")}</strong><small class="cell-sub">${escapeHtml(event.reason)}</small></td><td>${escapeHtml(event.action)}</td></tr>`).join("")}</tbody></table></div>`;
+  return `<div class="table-wrap"><table><thead><tr><th>Time</th><th>Asset / device</th><th>Source IP</th><th>Request / process</th><th>Response</th><th>Rule / reason</th><th>Action / review</th></tr></thead><tbody>${events.map((event) => `<tr><td>${new Date(event.createdAt).toLocaleString()}</td><td>${escapeHtml(event.deviceName || event.assetName || event.assetId || "—")}</td><td class="mono">${escapeHtml(event.observedSourceIp || "—")}</td><td><strong>${escapeHtml(event.method || event.source)}</strong><small class="cell-sub mono">${escapeHtml(event.path || event.requestDetails || event.processDetails || event.category)}</small><small class="cell-sub">${escapeHtml(event.userAgent || "")}</small></td><td>${event.responseStatus || "—"}</td><td><strong>${escapeHtml(event.detectionRule || "none")}</strong><small class="cell-sub">${escapeHtml(event.reason)}</small></td><td>${escapeHtml(event.action)}${event.source==="website-gateway"&&event.detectionRule!=="none"&&event.detectionRule!=="allowlist"?`<br><button class="text-button pilot-review" data-false-positive="${event.id}" data-marked="${Boolean(event.falsePositive)}">${event.falsePositive?"Clear false-positive label":"Mark false positive"}</button>${event.reviewedBy?`<small class="cell-sub">Reviewed by ${escapeHtml(event.reviewedBy)}</small>`:""}`:""}</td></tr>`).join("")}</tbody></table></div>`;
+}
+async function reviewFalsePositive(eventId,falsePositive){
+  try{await api(`/api/events/${eventId}/false-positive`,{method:"POST",body:JSON.stringify({falsePositive})});await refresh();}
+  catch(error){state.error=error.message;render();}
+}
+async function downloadPilotReport(){
+  try{const response=await fetch("/api/pilot/report?days=7",{credentials:"include"});if(!response.ok)throw new Error("Pilot report export failed");const blob=await response.blob(),url=URL.createObjectURL(blob),link=document.createElement("a");link.href=url;link.download="sentrygate-pilot-report.json";link.click();URL.revokeObjectURL(url);}
+  catch(error){state.error=error.message;render();}
 }
 function auditRow(entry) { return `<div class="audit-entry"><time>${new Date(entry.createdAt).toLocaleString()}</time><strong>${escapeHtml(entry.action)}</strong><span>${escapeHtml(entry.actor)}</span><p>${escapeHtml(entry.detail)}</p></div>`; }
 function emptyState(text) { return `<div class="empty-state">${text}</div>`; }
-function pageLabel(page) { return ({ overview: "Overview", assets: "Protected Assets", devices: "Devices", firewall: "Firewall", investigation: "Investigation", actions: "Actions", alerts: "Alerts", events: "Events", settings: "Settings" })[page]; }
-function pageTitle(page) { return ({ overview: "Overview", assets: "Protected assets", devices: "Windows devices", firewall: "Firewall rules", investigation: "Incident investigation", actions: "Response actions", alerts: "Alerts", events: "Events", settings: "Settings" })[page]; }
-function navIcon(page) { return ({ overview: "⌂", assets: "◈", devices: "▣", firewall: "▤", investigation: "⌕", actions: "⚑", alerts: "!", events: "⌁", settings: "⚙" })[page]; }
+function pageLabel(page) { return ({ overview: "Overview", pilot: "Pilot", assets: "Protected Assets", devices: "Devices", firewall: "Firewall", investigation: "Investigation", actions: "Actions", alerts: "Alerts", events: "Events", settings: "Settings" })[page]; }
+function pageTitle(page) { return ({ overview: "Overview", pilot: "Controlled pilot", assets: "Protected assets", devices: "Windows devices", firewall: "Firewall rules", investigation: "Incident investigation", actions: "Response actions", alerts: "Alerts", events: "Events", settings: "Settings" })[page]; }
+function navIcon(page) { return ({ overview: "⌂", pilot: "◉", assets: "◈", devices: "▣", firewall: "▤", investigation: "⌕", actions: "⚑", alerts: "!", events: "⌁", settings: "⚙" })[page]; }
 
 async function createAsset(event) {
   event.preventDefault();
@@ -233,6 +255,7 @@ async function saveProtection(event) {
     upstreamUrl: values.upstreamUrl,
     enabled: form.elements.enabled.checked,
     mode: values.mode,
+    failureMode: values.failureMode,
     rateLimitCount: Number(values.rateLimitCount),
     windowSeconds: Number(values.windowSeconds),
     sensitivePathsEnabled: form.elements.sensitivePathsEnabled.checked,
@@ -403,6 +426,23 @@ async function rollbackAction(id) {
 async function openDevice(id) {
   try { state.device = await api(`/api/devices/${encodeURIComponent(id)}`); state.newDeviceCredential = null; render(); }
   catch (error) { state.error = error.message; }
+}
+
+async function openAsset(id) {
+  try { state.assetDetail = await api(`/api/assets/${id}`); state.page = "assets"; render(); }
+  catch (error) { state.error = error.message; render(); }
+}
+
+function assetInvestigationDetail(detail) {
+  const a=detail.asset;
+  return `<button id="back-assets" class="text-button">← Back to assets</button><section class="section-block"><div class="section-heading"><div><p class="eyebrow">ASSET INVESTIGATION · ${escapeHtml(a.type)}</p><h2>${escapeHtml(a.name)}</h2></div><span class="status">${escapeHtml(a.healthStatus || a.status)}</span></div><div class="device-summary"><span><strong>Address</strong>${escapeHtml(a.address || "—")}</span><span><strong>Version</strong>${escapeHtml(a.version || "—")}</span><span><strong>Last heartbeat</strong>${a.lastHeartbeat ? new Date(a.lastHeartbeat).toLocaleString() : "Not reported"}</span><span><strong>Warnings</strong>${escapeHtml(a.healthDetail || (detail.pendingConfig?.status === "pending" ? `Configuration v${detail.pendingConfig.version} pending (${detail.pendingConfig.attempts} attempts)` : "None reported"))}</span></div>${a.deviceId ? `<button id="remove-asset" class="quiet-button" data-asset-id="${a.id}">Remove asset and revoke agent</button>` : ""}</section><section class="section-block"><div class="section-heading"><h2>Recent events</h2><span class="subtle">${detail.recentEvents.length}</span></div>${eventTable(detail.recentEvents.map(e=>({...e,assetName:a.name,createdAt:e.createdAt,requestDetails:e.request_details,processDetails:e.process_details,detectionRule:e.detection_rule,observedSourceIp:e.observed_source_ip})))}</section><section class="section-block"><div class="section-heading"><h2>Active SentryGate rules</h2><span class="subtle">${detail.activeRules.length}</span></div>${detail.activeRules.length ? simpleTable(["Rule","Remote","Protocol / port","Expires","State"],detail.activeRules.map(r=>[r.id,r.remoteCidr,`${r.protocol} ${r.localPort}`,new Date(r.expiresAt).toLocaleString(),r.status])) : emptyState("No active or pending rules for this asset.")}</section><section class="section-block"><div class="section-heading"><h2>Recent alerts</h2></div>${alertList(detail.recentAlerts)}</section>`;
+}
+
+async function removeAsset(event) {
+  const id=event.currentTarget.dataset.assetId;
+  if(!confirm("Remove this computer asset and revoke its agent credential? Evidence is retained. Active SentryGate firewall rules must first be rolled back and confirmed removed.")) return;
+  try { await api(`/api/assets/${id}/remove`,{method:"POST",body:JSON.stringify({confirmed:true})}); state.assetDetail=null; await refresh(); }
+  catch(error) { alert(error.message); }
 }
 
 async function enrollDevice(event) {

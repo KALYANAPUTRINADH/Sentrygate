@@ -3,3 +3,4 @@ apps/api/data/
 node_modules/
 *.db-shm
 *.db-wal
+sentrygate-pilot-report*.json

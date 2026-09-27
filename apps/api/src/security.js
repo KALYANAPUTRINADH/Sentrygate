@@ -18,6 +18,7 @@ export function signSession(admin, secret) {
   const payload = {
     sub: String(admin.id),
     email: admin.email,
+    jti: crypto.randomUUID(),
     exp: Date.now() + 8 * 60 * 60 * 1000
   };
   const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
@@ -37,7 +38,7 @@ export function verifySession(token, secret) {
   let payload;
   try { payload = JSON.parse(Buffer.from(body, "base64url").toString("utf8")); }
   catch { return null; }
-  if (!payload || typeof payload.sub !== "string" || !Number.isFinite(payload.exp) || payload.exp < Date.now()) {
+  if (!payload || typeof payload.sub !== "string" || typeof payload.jti !== "string" || !Number.isFinite(payload.exp) || payload.exp < Date.now()) {
     return null;
   }
   return payload;

@@ -1,4 +1,4 @@
-param([string]$InstallRoot = "$env:ProgramFiles\SentryGate\Agent", [string]$DataRoot = "$env:ProgramData\SentryGate\Agent", [Parameter(Mandatory=$true)][string]$DeviceId, [string]$ApiBaseUrl = 'http://127.0.0.1:4300', [switch]$EnableFirewallManagement)
+param([string]$InstallRoot = "$env:ProgramFiles\SentryGate\Agent", [string]$DataRoot = "$env:ProgramData\SentryGate\Agent", [Parameter(Mandatory=$true)][string]$DeviceId, [string]$ApiBaseUrl = 'http://127.0.0.1:4300', [string]$CaCertificatePath = '', [switch]$EnableFirewallManagement)
 $ErrorActionPreference = 'Stop'
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Administrator permission is required to install the Windows service.' }
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
@@ -8,7 +8,8 @@ if ($nodeVersion -lt [version]'24.0') { throw 'Node.js 24 or later is required.'
 if (Get-Service SentryGateAgent -ErrorAction SilentlyContinue) { throw 'SentryGateAgent service already exists. Uninstall it before reinstalling.' }
 New-Item -ItemType Directory -Path $InstallRoot,$DataRoot -Force | Out-Null
 Copy-Item (Join-Path $repoRoot 'apps\agent\*') $InstallRoot -Recurse -Force
-& (Join-Path $InstallRoot 'scripts\configure-agent.ps1') -DeviceId $DeviceId -ApiBaseUrl $ApiBaseUrl -AgentRoot $DataRoot -DpapiScope LocalMachine -InstallContext
+$configureArgs = @{ DeviceId=$DeviceId; ApiBaseUrl=$ApiBaseUrl; AgentRoot=$DataRoot; DpapiScope='LocalMachine'; InstallContext=$true; CaCertificatePath=$CaCertificatePath }
+& (Join-Path $InstallRoot 'scripts\configure-agent.ps1') @configureArgs
 $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 if (-not (Test-Path $compiler)) { $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319\csc.exe' }
 if (-not (Test-Path $compiler)) { throw 'The .NET Framework C# compiler is required to build the service host.' }
@@ -18,7 +19,8 @@ $serviceExe = Join-Path $InstallRoot 'SentryGateAgentService.exe'
 if ($LASTEXITCODE -ne 0) { throw 'Could not build the Windows service host.' }
 $entry = Join-Path $InstallRoot 'src\agent.js'
 $config = Join-Path $DataRoot 'config.json'
-$service = New-Service -Name SentryGateAgent -DisplayName 'SentryGate Windows Agent' -Description 'Observe-only endpoint metadata and security event reporting.' -BinaryPathName "`"$serviceExe`" `"$node`" `"$entry`" `"$config`"" -StartupType Automatic
+$caArgument = if ($CaCertificatePath) { " `"$((Resolve-Path -LiteralPath $CaCertificatePath).Path)`"" } else { '' }
+$service = New-Service -Name SentryGateAgent -DisplayName 'SentryGate Windows Agent' -Description 'Observe-only endpoint metadata and security event reporting.' -BinaryPathName "`"$serviceExe`" `"$node`" `"$entry`" `"$config`"$caArgument" -StartupType Automatic
 if (-not $EnableFirewallManagement) {
   $serviceConfig = & sc.exe config SentryGateAgent obj= 'NT AUTHORITY\LocalService' password= ''
   if ($LASTEXITCODE -ne 0) { sc.exe delete SentryGateAgent | Out-Null; throw 'Could not configure the least-privilege LocalService account.' }

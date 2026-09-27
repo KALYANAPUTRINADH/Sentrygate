@@ -16,6 +16,8 @@ docs/                  Threat model and deployment instructions
 
 The stack uses Node.js 24+, built-in `node:sqlite`, built-in HTTP, and no npm runtime dependencies. The API/database and gateway run locally. The Windows service host is built from the included C# source using the .NET Framework compiler.
 
+Milestone 8 adds HTTPS listeners for controlled deployment, session revocation and sign-in throttling, per-site gateway outage behavior, bounded local/API storage with scheduled retention, structured operational logs, SQLite backup/restore, heartbeat alerts, and an isolated synthetic load test. Local loopback HTTP remains available only for development. See [the controlled-pilot deployment runbook](docs/deployment.md) and [updated threat model](docs/threat-model.md); this is not a production-readiness certification.
+
 ## Dashboard development (Windows PowerShell)
 
 From the repository root:
@@ -117,6 +119,29 @@ No output means the rule is absent. This procedure checks rule configuration; it
 npm run demo:firewall
 ```
 
+## Milestone 7: multiple assets and administrators
+
+Each protected website has its own encrypted-at-rest gateway credential; the gateway presents it only for that website's event submissions. Each Windows enrollment is linked to exactly one computer asset (a dedicated computer asset is created automatically if you do not select one) and has its own agent credential. Rotating or revoking one credential does not change any other asset. A computer asset cannot be linked to a second active agent.
+
+The asset list and asset investigation view show connection state, agent version/heartbeat, recent evidence, alerts, configuration delivery, and SentryGate-owned rules. Website thresholds and allowlists are already stored per website. Device settings are queued by version per device; the agent retries the latest pending version after reconnecting and acknowledges it with its device credential. Status is visible as pending/applied/failed.
+
+The first administrator is an `owner`. Owners can create additional administrators through the authenticated API (`POST /api/admins`) with `email`, a 12-character-minimum `password`, and role `owner`, `security_analyst`, or `read_only_viewer`. Analysts can add incident notes, change incident status, and create suggestion-only policies. Viewers have read-only API access. All other writes, including enrollment, credential lifecycle, website settings, and firewall approvals, are owner-only; enforcement is in the API.
+
+Asset removal is a soft removal, retains historical evidence, and revokes the linked agent credential. The API refuses to remove a computer while any SentryGate-owned rule remains proposed, active, failed, expired-awaiting-verification, or pending removal. Roll back the rule and wait for the agent to report it removed, then retry. For websites, active gateway actions must be rolled back or expire first. No unrelated firewall rule is touched.
+
+### Two-site / two-agent local demo
+
+Start SentryGate and create the owner account using the setup commands above. In **Protected Assets**, register `Demo Site A` and `Demo Site B`, each with its own sample upstream address; configure each website separately. In a second PowerShell terminal, start a sample site:
+
+```powershell
+$env:SAMPLE_SITE_PORT = '4320'
+npm run sample:site
+```
+
+For a second sample website, open another terminal and run the sample site on port `4321` (the sample script reads `SAMPLE_SITE_PORT`). Set Site A upstream to `http://127.0.0.1:4320` and Site B to `http://127.0.0.1:4321`; use the distinct gateway paths shown in each website's Configure panel. Configure a different threshold or allowlist per website to confirm settings do not bleed across assets.
+
+Enroll two simulated Windows agents as separate devices (omit **Computer asset** to auto-create a distinct asset for each). The dashboard returns a one-time credential for each. For safe API-only simulation, use separate device identities and credentials with the agent development script or the enrollment UI; `npm run demo:agent` remains a single clearly marked synthetic fixture and does not enroll a host. Verify each computer's asset page shows only its own heartbeat, snapshot, events, config queue, and rules. A website credential rotated under its asset remains isolated from the other site. Never route a production domain through this local demo.
+
 To stop and uninstall the service from elevated PowerShell:
 
 ```powershell
@@ -196,4 +221,4 @@ npm run build
 
 Existing gateway behavior remains available: `npm run sample:site` starts the local HTTP upstream, and `npm run demo:gateway` runs the safe gateway smoke test. WebSocket upgrades are not supported by the website gateway. Do not route a production domain through this local development setup.
 
-Review [docs/threat-model.md](docs/threat-model.md) and [docs/deployment.md](docs/deployment.md) before deployment. Firewall changes remain administrator-approved only; SentryGate does not create automatic blocks or disable the existing firewall.
+Review [docs/threat-model.md](docs/threat-model.md), [docs/deployment.md](docs/deployment.md), and [docs/pilot.md](docs/pilot.md) before deployment. Milestone 9 adds a safe loopback simulation, pilot preflight checks, dashboard measurements, JSON reports, and a scoped rollback command. Do not route a live website until local and staging gates pass and you approve the change. Firewall changes remain administrator-approved only; SentryGate does not create automatic blocks or disable the existing firewall.

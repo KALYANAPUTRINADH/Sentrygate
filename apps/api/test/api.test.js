@@ -8,6 +8,7 @@ import { loadConfig } from "../src/config.js";
 import { openDatabase } from "../src/db.js";
 import { expireGatewayActions, validateActionTarget } from "../src/actions.js";
 import { correlateEvent } from "../src/incidents.js";
+import { sweepOperationalState } from "../src/operations.js";
 
 let db;
 let server;
@@ -45,6 +46,25 @@ test("creates the first administrator with a salted password hash and authentica
   assert.ok(admin.password_hash.length > 40);
   assert.ok(admin.password_salt.length > 12);
   assert.match(setup.cookie, /^sentrygate_session=/);
+  assert.match(setup.response.headers.get("set-cookie"), /HttpOnly/);
+  assert.match(setup.response.headers.get("set-cookie"), /SameSite=Strict/);
+});
+
+test("rejects cross-origin administrator mutations and external cleartext agent endpoints", async () => {
+  const session=await setupAdmin();
+  const forbidden=await jsonFetch("/api/assets",{method:"POST",headers:{Cookie:session.cookie,Origin:"https://attacker.invalid"},body:JSON.stringify({name:"Cross origin",type:"website",address:"owned.test",description:""})});
+  assert.equal(forbidden.response.status,403);
+  assert.throws(()=>loadConfig({sessionSecret:"test-secret-for-sentrygate-suite-32",apiBaseUrl:"http://api.example.invalid"}),/HTTPS/);
+});
+
+test("throttles failed sign-ins and invalidates copied sessions on logout",async()=>{
+  const setup=await setupAdmin(),headers={Cookie:setup.cookie};
+  for(let i=0;i<10;i++)assert.equal((await jsonFetch("/api/login",{method:"POST",body:JSON.stringify({email:"admin@example.com",password:"wrong password"})})).response.status,401);
+  const limited=await jsonFetch("/api/login",{method:"POST",body:JSON.stringify({email:"admin@example.com",password:"correct horse battery"})});
+  assert.equal(limited.response.status,429);
+  assert.ok(limited.response.headers.get("retry-after"));
+  assert.equal((await jsonFetch("/api/logout",{method:"POST",headers})).response.status,204);
+  assert.equal((await jsonFetch("/api/assets",{headers})).response.status,401);
 });
 
 test("rejects weak setup credentials and protects API data before login", async () => {
@@ -471,4 +491,81 @@ test("validates device enrollment and collection settings", async () => {
   const enrolled = await jsonFetch("/api/devices/enroll", { method: "POST", headers, body: JSON.stringify({ name: "Desk", hostname: "desk", osVersion: "Windows", agentVersion: "0.3" }) });
   const settings = await jsonFetch(`/api/devices/${enrolled.body.deviceId}/settings`, { method: "PUT", headers, body: JSON.stringify({ collectProcesses: false, collectConnections: true, intervalSeconds: 5, outboundConnectionThreshold: 50, retainedDays: 30 }) });
   assert.equal(settings.response.status, 400);
+});
+
+test("Milestone 7 isolates computer assets, queues configuration retries, enforces roles, and guards removal", async () => {
+  const owner = await setupAdmin(), ownerHeaders = { Cookie: owner.cookie };
+  const first = await jsonFetch("/api/devices/enroll", { method: "POST", headers: ownerHeaders, body: JSON.stringify({ name: "Agent A", hostname: "SG-A", osVersion: "Windows", agentVersion: "1.0" }) });
+  const second = await jsonFetch("/api/devices/enroll", { method: "POST", headers: ownerHeaders, body: JSON.stringify({ name: "Agent B", hostname: "SG-B", osVersion: "Windows", agentVersion: "1.0" }) });
+  assert.notEqual(first.body.assetId, second.body.assetId);
+  const assetA = await jsonFetch(`/api/assets/${first.body.assetId}`, { headers: ownerHeaders });
+  assert.equal(assetA.body.asset.deviceId, first.body.deviceId);
+  const settings = { collectProcesses: false, collectConnections: true, intervalSeconds: 30, outboundConnectionThreshold: 55, retainedDays: 30 };
+  assert.equal((await jsonFetch(`/api/devices/${first.body.deviceId}/settings`, { method: "PUT", headers: ownerHeaders, body: JSON.stringify(settings) })).response.status, 200);
+  const deviceAuth = { Authorization: `Bearer ${first.body.credential}` };
+  const config = await jsonFetch(`/api/devices/${first.body.deviceId}/config`, { headers: deviceAuth });
+  assert.equal(config.body.configVersion, 2);
+  assert.equal(db.prepare("SELECT status FROM device_config_updates WHERE device_id=? AND version=2").get(first.body.deviceId).status, "pending");
+  await jsonFetch(`/api/devices/${first.body.deviceId}/config`, { headers: deviceAuth });
+  assert.equal(db.prepare("SELECT attempts FROM device_config_updates WHERE device_id=? AND version=2").get(first.body.deviceId).attempts, 2);
+  await jsonFetch(`/api/devices/${first.body.deviceId}/config/ack`, { method: "POST", headers: deviceAuth, body: JSON.stringify({ version: 2, status: "applied", detail: "test applied" }) });
+  assert.equal(db.prepare("SELECT status FROM device_config_updates WHERE device_id=? AND version=2").get(first.body.deviceId).status, "applied");
+
+  db.prepare("UPDATE admins SET role='read_only_viewer' WHERE email=?").run("admin@example.com");
+  assert.equal((await jsonFetch("/api/assets", { headers: ownerHeaders })).response.status, 200);
+  assert.equal((await jsonFetch("/api/assets", { method: "POST", headers: ownerHeaders, body: JSON.stringify({ name: "Denied", type: "website", address: "host", description: "" }) })).response.status, 403);
+
+  const proposal = await jsonFetch("/api/firewall/rules", { method: "POST", headers: ownerHeaders, body: JSON.stringify({ deviceId: first.body.deviceId, remoteCidr: "198.51.100.8/32", protocol: "TCP", localPort: 65000, reason: "test removal guard", evidence: "synthetic evidence", expiresAt: new Date(Date.now() + 600000).toISOString(), idempotencyKey: randomUUID() }) });
+  assert.equal(proposal.response.status, 403);
+  db.prepare("UPDATE admins SET role='owner' WHERE email=?").run("admin@example.com");
+  const rule = await jsonFetch("/api/firewall/rules", { method: "POST", headers: ownerHeaders, body: JSON.stringify({ deviceId: first.body.deviceId, remoteCidr: "198.51.100.8/32", protocol: "TCP", localPort: 65000, reason: "test removal guard", evidence: "synthetic evidence", expiresAt: new Date(Date.now() + 600000).toISOString(), idempotencyKey: randomUUID() }) });
+  assert.equal(rule.response.status, 201);
+  const removal = await jsonFetch(`/api/assets/${first.body.assetId}/remove`, { method: "POST", headers: ownerHeaders, body: JSON.stringify({ confirmed: true }) });
+  assert.equal(removal.response.status, 409);
+  assert.equal(removal.body.rules[0].id, rule.body.rule.id);
+  assert.equal((await jsonFetch(`/api/assets/${second.body.assetId}`, { headers: ownerHeaders })).body.asset.deviceId, second.body.deviceId);
+  const crossAssetPolicy=await jsonFetch("/api/action-policies",{method:"POST",headers:ownerHeaders,body:JSON.stringify({name:"Cross asset test",assetId:first.body.assetId,detectionRule:"*",minimumSeverity:"high",minimumEventCount:3,windowMinutes:10,targetType:"device",targetId:second.body.deviceId,protocol:"TCP",localPort:443,durationMinutes:10})});
+  assert.equal(crossAssetPolicy.response.status,400);
+});
+
+test("website gateway credentials are unique and cannot submit events for another asset", async () => {
+  const session=await setupAdmin(),headers={Cookie:session.cookie};
+  const create=async(name)=> (await jsonFetch("/api/assets",{method:"POST",headers,body:JSON.stringify({name,type:"website",address:`https://${name}.test`,description:"owned test site"})})).body.id;
+  const a=await create("site-a"),b=await create("site-b");
+  const ca=(await jsonFetch(`/api/assets/${a}/credential/rotate`,{method:"POST",headers})).body.credential;
+  const cb=(await jsonFetch(`/api/assets/${b}/credential/rotate`,{method:"POST",headers})).body.credential;
+  assert.notEqual(ca,cb);
+  const event={assetId:b,eventId:randomUUID(),timestamp:new Date().toISOString(),sourceIp:"198.51.100.20",method:"GET",path:"/",userAgent:"test",responseStatus:200,detectionRule:"none",action:"forwarded",severity:"info",reason:"No rule matched"};
+  const forged=await jsonFetch("/api/agent/events",{method:"POST",headers:{"X-SentryGate-Asset-Credential":ca},body:JSON.stringify(event)});
+  assert.equal(forged.response.status,401);
+  const accepted=await jsonFetch("/api/agent/events",{method:"POST",headers:{"X-SentryGate-Asset-Credential":cb},body:JSON.stringify(event)});
+  assert.equal(accepted.response.status,201);
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM events WHERE asset_id=?").get(a).count,0);
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM events WHERE asset_id=?").get(b).count,1);
+});
+
+test("operational sweeps alert on stale agents and gateways, clear on recovery, and enforce retention", async()=>{
+  const siteId=Number(db.prepare("INSERT INTO assets(name,type,owner,status,address,description,created_at) VALUES('Ops site','website','owner','healthy','ops.test','','2026-09-01T00:00:00.000Z')").run().lastInsertRowid);
+  const computerId=Number(db.prepare("INSERT INTO assets(name,type,owner,status,address,description,created_at) VALUES('Ops PC','computer','owner','healthy','OPS-PC','','2026-09-01T00:00:00.000Z')").run().lastInsertRowid);
+  const deviceId=randomUUID(),old="2026-09-27T08:00:00.000Z";
+  db.prepare(`INSERT INTO device_agents(device_id,name,hostname,os_version,agent_version,credential_hash,enrolled_at,last_heartbeat,collection_interval_seconds,asset_id)
+    VALUES(?,?,?,?,?,?,?,?,?,?)`).run(deviceId,"Ops agent","OPS-PC","Windows","1.0","verifier",old,old,30,computerId);
+  db.prepare("INSERT INTO website_gateway_status(asset_id,gateway_version,last_heartbeat,health_status) VALUES(?,?,?,'healthy')").run(siteId,"0.7.0",old);
+  const config=loadConfig({dbPath:path.join(os.tmpdir(),`sentrygate-ops-${randomUUID()}.db`),sessionSecret:"test-secret-for-sentrygate-suite-32"});
+  const now=new Date("2026-09-27T09:00:00.000Z");
+  sweepOperationalState(db,config,now);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM alerts WHERE title='Windows agent stopped reporting' AND device_id=? AND status='open'").get(deviceId).n,1);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM alerts WHERE title='Website gateway stopped reporting' AND asset_id=? AND status='open'").get(siteId).n,1);
+  db.prepare("UPDATE device_agents SET last_heartbeat=? WHERE device_id=?").run(now.toISOString(),deviceId);
+  db.prepare("UPDATE website_gateway_status SET last_heartbeat=? WHERE asset_id=?").run(now.toISOString(),siteId);
+  sweepOperationalState(db,config,now);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM alerts WHERE title IN ('Windows agent stopped reporting','Website gateway stopped reporting') AND status='open'").get().n,0);
+});
+
+test("health check fails closed with a generic response when SQLite is unavailable",async()=>{
+  const broken=openDatabase(path.join(os.tmpdir(),`sentrygate-closed-${randomUUID()}.db`));broken.close();
+  const isolated=createServer(broken,loadConfig({sessionSecret:"test-secret-for-sentrygate-suite-32",port:0}));
+  await new Promise(resolve=>isolated.listen(0,"127.0.0.1",resolve));
+  try{const response=await fetch(`http://127.0.0.1:${isolated.address().port}/api/health`);assert.equal(response.status,500);assert.deepEqual(await response.json(),{error:"Internal server error"});}
+  finally{await new Promise(resolve=>isolated.close(resolve));}
 });

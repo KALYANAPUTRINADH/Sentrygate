@@ -17,10 +17,11 @@ export async function runAgent({ configPath = process.env.SENTRYGATE_AGENT_CONFI
   const credentialPath = path.resolve(path.dirname(configPath), config.credentialFile ?? "credential.dpapi");
   const credential = readProtected(credentialPath, config.dpapiScope ?? "CurrentUser");
   const dataRoot = config.dataRoot ?? path.join(os.homedir(), ".sentrygate-agent");
-  const spool = (spoolFactory ?? ((dbPath) => new EventSpool(dbPath, {
+  const spool = (spoolFactory ?? ((dbPath,limits) => new EventSpool(dbPath, {
     protect: (value) => protectText(value, config.dpapiScope ?? "CurrentUser"),
-    unprotect: (value) => unprotectText(value, config.dpapiScope ?? "CurrentUser")
-  })))(path.join(dataRoot, "events.db"));
+    unprotect: (value) => unprotectText(value, config.dpapiScope ?? "CurrentUser"),
+    maxBytes: limits.maxBytes
+  })))(path.join(dataRoot, "events.db"),{maxBytes:config.spoolMaxBytes??268_435_456});
   const detector = createDetector();
   const policyPath = path.join(dataRoot, "firewall-policy.dpapi");
   const policyStore = {
@@ -41,15 +42,22 @@ export async function runAgent({ configPath = process.env.SENTRYGATE_AGENT_CONFI
 
 export async function sampleAndReport({ config, credential, spool, detector, collect, now = new Date().toISOString(), fetchImpl = fetch, firewall = reconcileFirewall, policyStore, lookupImpl = lookup }) {
   const deviceId = config.deviceId;
+  const apiUrl=new URL(config.apiBaseUrl),apiHost=apiUrl.hostname.replace(/^\[|\]$/g,"");
+  if(apiUrl.protocol!=="https:" && !["127.0.0.1","::1","localhost"].includes(apiHost)) throw new Error("Agent API connections require HTTPS except for loopback development");
   let policyOnline = false;
   try {
     const policyResponse = await fetchImpl(`${config.apiBaseUrl.replace(/\/$/, "")}/api/devices/${deviceId}/config`, {
       headers: { Authorization: `Bearer ${credential}` }, signal: AbortSignal.timeout(10000)
     });
     if (policyResponse.ok) {
-      Object.assign(config, await policyResponse.json());
+      const receivedConfig = await policyResponse.json();
+      Object.assign(config, receivedConfig);
       policyOnline = true;
       policyStore?.save(config.firewallRules ?? []);
+      if (Number.isInteger(receivedConfig.configVersion)) await fetchImpl(`${config.apiBaseUrl.replace(/\/$/, "")}/api/devices/${deviceId}/config/ack`, {
+        method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${credential}` },
+        body: JSON.stringify({ version: receivedConfig.configVersion, status: "applied", detail: "Configuration received and stored by the agent." }), signal: AbortSignal.timeout(10000)
+      }).catch(() => {});
     }
   } catch { /* Continue with the last locally known collection policy during outages. */ }
   if (!policyOnline && policyStore) config.firewallRules = policyStore.load();
@@ -64,7 +72,7 @@ export async function sampleAndReport({ config, credential, spool, detector, col
   ]);
   const processes = telemetry.processes ?? [];
   const connections = telemetry.connections ?? [];
-  const collectionErrors = telemetry.collectionErrors ?? [];
+  const collectionErrors = [...(telemetry.collectionErrors ?? [])];
   let backendAddresses = [];
   try {
     const host = new URL(config.apiBaseUrl).hostname.replace(/^\[|\]$/g, "");
@@ -72,6 +80,7 @@ export async function sampleAndReport({ config, credential, spool, detector, col
   } catch { /* Backend address telemetry is best effort; API-side DNS validation also applies. */ }
   spool.pruneBefore(new Date(Date.now() - (config.retainedDays ?? 30) * 86_400_000).toISOString());
   if (!collectionErrors.length) for (const event of detector.inspect({ connections, processes, threshold: config.outboundConnectionThreshold ?? 40, now })) spool.enqueue(event);
+  if(spool.storageBytes?.()>=spool.maxBytes || spool.count()>=spool.maxEvents)collectionErrors.push("Local encrypted event spool reached its configured capacity; new detections may not be queued until delivery or retention frees space.");
   const report = { device: { deviceId, ...identity }, timestamp: now, healthStatus: collectionErrors.length ? "degraded" : "healthy", collectionErrors, backendAddresses, processes, connections, events: spool.list(200) };
   try {
     const response = await fetchImpl(`${config.apiBaseUrl.replace(/\/$/, "")}/api/devices/${deviceId}/report`, {

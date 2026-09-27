@@ -5,7 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 export function openDatabase(dbPath) {
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
   const db = new DatabaseSync(dbPath);
-  db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
+  db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
   migrate(db);
   return db;
 }
@@ -19,7 +19,6 @@ export function migrate(db) {
       password_salt TEXT NOT NULL,
       role TEXT NOT NULL DEFAULT 'owner',
       created_at TEXT NOT NULL
-      ,removed_at TEXT
     );
 
     CREATE TABLE IF NOT EXISTS assets (
@@ -31,7 +30,8 @@ export function migrate(db) {
       address TEXT NOT NULL DEFAULT '',
       description TEXT NOT NULL DEFAULT '',
       upstream_url TEXT NOT NULL DEFAULT '',
-      created_at TEXT NOT NULL
+      created_at TEXT NOT NULL,
+      removed_at TEXT
     );
 
     CREATE TABLE IF NOT EXISTS alerts (
@@ -67,7 +67,19 @@ export function migrate(db) {
       detection_rule TEXT NOT NULL DEFAULT 'none',
       device_id TEXT,
       source_event_id TEXT,
+      false_positive INTEGER NOT NULL DEFAULT 0,
+      reviewed_by TEXT,
+      reviewed_at TEXT,
       created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS gateway_request_metrics (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      asset_id INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+      event_id INTEGER REFERENCES events(id) ON DELETE SET NULL,
+      observed_at TEXT NOT NULL,
+      duration_ms REAL NOT NULL,
+      upstream_error INTEGER NOT NULL DEFAULT 0
     );
 
     CREATE TABLE IF NOT EXISTS audit_log (
@@ -78,11 +90,15 @@ export function migrate(db) {
       detail TEXT NOT NULL,
       created_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS revoked_sessions (
+      session_id TEXT PRIMARY KEY, expires_at INTEGER NOT NULL, revoked_at TEXT NOT NULL
+    );
 
     CREATE TABLE IF NOT EXISTS gateway_rules (
       asset_id INTEGER PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
       enabled INTEGER NOT NULL DEFAULT 1,
       mode TEXT NOT NULL DEFAULT 'observe',
+      failure_mode TEXT NOT NULL DEFAULT 'open',
       rate_limit_count INTEGER NOT NULL DEFAULT 120,
       window_seconds INTEGER NOT NULL DEFAULT 60,
       sensitive_paths_enabled INTEGER NOT NULL DEFAULT 1,
@@ -111,6 +127,15 @@ export function migrate(db) {
       token_tag TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS asset_credentials (
+      asset_id INTEGER PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE, token_hash TEXT NOT NULL,
+      token_ciphertext TEXT NOT NULL, token_iv TEXT NOT NULL, token_tag TEXT NOT NULL,
+      updated_at TEXT NOT NULL, revoked_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS website_gateway_status (
+      asset_id INTEGER PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
+      gateway_version TEXT NOT NULL, last_heartbeat TEXT NOT NULL, health_status TEXT NOT NULL DEFAULT 'healthy'
+    );
 
     CREATE TABLE IF NOT EXISTS device_agents (
       device_id TEXT PRIMARY KEY, name TEXT NOT NULL, hostname TEXT NOT NULL,
@@ -120,8 +145,8 @@ export function migrate(db) {
       collection_connections INTEGER NOT NULL DEFAULT 1, collection_interval_seconds INTEGER NOT NULL DEFAULT 30,
       outbound_connection_threshold INTEGER NOT NULL DEFAULT 40, retained_days INTEGER NOT NULL DEFAULT 30,
       is_demo INTEGER NOT NULL DEFAULT 0,
-      backend_addresses TEXT NOT NULL DEFAULT '[]'
-      ,config_version INTEGER NOT NULL DEFAULT 1
+      backend_addresses TEXT NOT NULL DEFAULT '[]',
+      config_version INTEGER NOT NULL DEFAULT 1
     );
     CREATE TABLE IF NOT EXISTS device_snapshots (
       device_id TEXT PRIMARY KEY REFERENCES device_agents(device_id) ON DELETE CASCADE,
@@ -209,6 +234,7 @@ export function migrate(db) {
   addColumn(db, "assets", "address", "TEXT NOT NULL DEFAULT ''");
   addColumn(db, "assets", "description", "TEXT NOT NULL DEFAULT ''");
   addColumn(db, "assets", "upstream_url", "TEXT NOT NULL DEFAULT ''");
+  addColumn(db, "gateway_rules", "failure_mode", "TEXT NOT NULL DEFAULT 'open'");
   addColumn(db, "assets", "removed_at", "TEXT");
   addColumn(db, "admins", "role", "TEXT NOT NULL DEFAULT 'owner'");
   addColumn(db, "device_agents", "config_version", "INTEGER NOT NULL DEFAULT 1");
@@ -230,10 +256,19 @@ export function migrate(db) {
   addColumn(db, "events", "detection_rule", "TEXT NOT NULL DEFAULT 'none'");
   addColumn(db, "events", "device_id", "TEXT");
   addColumn(db, "events", "source_event_id", "TEXT");
+  addColumn(db, "events", "false_positive", "INTEGER NOT NULL DEFAULT 0");
+  addColumn(db, "events", "reviewed_by", "TEXT");
+  addColumn(db, "events", "reviewed_at", "TEXT");
   db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_events_device_event ON events(device_id, source_event_id)
     WHERE device_id IS NOT NULL AND source_event_id IS NOT NULL;
     CREATE INDEX IF NOT EXISTS idx_events_device_time ON events(device_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_alerts_device_time ON alerts(device_id, created_at);`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at);
+    CREATE INDEX IF NOT EXISTS idx_gateway_metrics_time ON gateway_request_metrics(observed_at);
+    CREATE INDEX IF NOT EXISTS idx_gateway_metrics_asset_time ON gateway_request_metrics(asset_id,observed_at);
+    CREATE INDEX IF NOT EXISTS idx_alerts_created_at ON alerts(created_at);
+    CREATE INDEX IF NOT EXISTS idx_audit_created_at ON audit_log(created_at);
+    CREATE INDEX IF NOT EXISTS idx_incident_reports_created_at ON incident_reports(created_at);`);
   db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_events_source_event ON events(source_event_id) WHERE source_event_id IS NOT NULL;
     CREATE INDEX IF NOT EXISTS idx_incident_correlation ON incidents(correlation_key,last_seen,status);
     CREATE INDEX IF NOT EXISTS idx_incident_events_event ON incident_events(event_id);

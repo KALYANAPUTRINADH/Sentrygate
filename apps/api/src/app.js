@@ -1,31 +1,47 @@
 import fs from "node:fs";
 import http from "node:http";
+import https from "node:https";
 import path from "node:path";
 import net from "node:net";
 import crypto from "node:crypto";
 import { lookup } from "node:dns/promises";
 import { recordAudit } from "./audit.js";
-import { rotateAgentCredential, verifyAgentCredential } from "./agent-credentials.js";
+import { rotateAgentCredential, rotateAssetCredential, verifyAgentCredential, verifyAssetCredential } from "./agent-credentials.js";
 import { hashPassword, signSession, verifyPassword, verifySession } from "./security.js";
 import { expireFirewallRules, overlaps, recordHistory, validateFirewallRule } from "./firewall.js";
 import { correlateEvent, incidentDetail, makeIncidentPdf } from "./incidents.js";
 import { actionForDashboard, evaluateIncidentPolicies, expireGatewayActions, validateActionTarget } from "./actions.js";
+import { logOperational } from "./logger.js";
+import { databaseBytes } from "./operations.js";
+import { generatePilotReport, pilotMetrics } from "./pilot.js";
 
 const cookieName = "sentrygate_session";
 
 export function createServer(db, config) {
-  return http.createServer(async (req, res) => {
+  const loginAttempts=new Map();
+  const listener=async (req, res) => {
+    res.setHeader("X-Content-Type-Options","nosniff");
+    res.setHeader("Referrer-Policy","no-referrer");
+    res.setHeader("X-Frame-Options","DENY");
+    res.setHeader("Content-Security-Policy","default-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'");
+    if(config.tlsCertPath) res.setHeader("Strict-Transport-Security","max-age=31536000");
     try {
-      await route(req, res, db, config);
+      await route(req, res, db, config, loginAttempts);
     } catch (error) {
-      console.error(error);
+      logOperational("error","request.failed",{method:req.method,path:new URL(req.url??"/","http://local").pathname,code:error.code??error.name??"Error"});
       json(res, error.statusCode ?? 500, { error: error.statusCode ? error.message : "Internal server error" });
     }
-  });
+  };
+  if(config.tlsCertPath) return https.createServer({cert:fs.readFileSync(config.tlsCertPath),key:fs.readFileSync(config.tlsKeyPath),minVersion:"TLSv1.2"},listener);
+  return http.createServer(listener);
 }
 
-async function route(req, res, db, config) {
+async function route(req, res, db, config, loginAttempts) {
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+  if(req.method === "POST" && ["/api/setup","/api/login"].includes(url.pathname) && req.headers.origin){
+    try{if(!sameRequestOrigin(req.headers.origin,req))return json(res,403,{error:"Cross-origin authentication request rejected"});}
+    catch{return json(res,403,{error:"Invalid request origin"});}
+  }
 
   const deviceReport = url.pathname.match(/^\/api\/devices\/([0-9a-f-]{36})\/report$/i);
   const deviceConfig = url.pathname.match(/^\/api\/devices\/([0-9a-f-]{36})\/config$/i);
@@ -100,6 +116,7 @@ async function route(req, res, db, config) {
     const token = /^Bearer\s+(.+)$/i.exec(req.headers.authorization ?? "")?.[1] ?? "";
     const device = db.prepare("SELECT * FROM device_agents WHERE device_id = ? AND revoked_at IS NULL AND is_demo = 0").get(deviceId);
     if (!device || !safeTokenMatches(token, device.credential_hash)) return json(res, 401, { error: "Valid device credential required" });
+    if(databaseCapacityReached(config))return json(res,507,{error:"Local database storage limit reached; device reporting paused until retention or capacity is addressed"});
     const body = await readJson(req, 10_000_000);
     const invalid = validateDeviceReport(body, deviceId);
     if (invalid) return json(res, 400, { error: invalid });
@@ -134,7 +151,9 @@ async function route(req, res, db, config) {
   }
 
   if (url.pathname === "/api/health" && req.method === "GET") {
-    return json(res, 200, { ok: true, service: "sentrygate-api" });
+    db.prepare("SELECT 1 AS ready").get();
+    const bytes=databaseBytes(config.dbPath);
+    return json(res, bytes<config.maxDbBytes?200:503, { ok: bytes<config.maxDbBytes, service: "sentrygate-api", database: "ready", storageBytes: bytes, storageLimitBytes: config.maxDbBytes, transport: config.tlsCertPath?"https":"loopback-http-development" });
   }
 
   if (url.pathname === "/api/session" && req.method === "GET") {
@@ -142,7 +161,7 @@ async function route(req, res, db, config) {
     return json(res, 200, {
       authenticated: Boolean(admin),
       setupRequired: setupRequired(db),
-      admin: admin ? { email: admin.email } : null
+      admin: admin ? { email: admin.email, role: admin.role } : null
     });
   }
 
@@ -158,7 +177,7 @@ async function route(req, res, db, config) {
     const email = body.email.toLowerCase();
     const { salt, hash } = hashPassword(body.password);
     const result = db
-      .prepare("INSERT INTO admins (email, password_hash, password_salt, created_at) VALUES (?, ?, ?, ?)")
+      .prepare("INSERT INTO admins (email, password_hash, password_salt, role, created_at) VALUES (?, ?, ?, 'owner', ?)")
       .run(email, hash, salt, new Date().toISOString());
     recordAudit(db, email, "admin.setup", "administrator", "Initial administrator created.");
     setCookie(res, signSession({ id: Number(result.lastInsertRowid), email }, config.sessionSecret), config);
@@ -171,21 +190,32 @@ async function route(req, res, db, config) {
     if (validation) {
       return json(res, 400, { error: validation });
     }
+    const peer=String(req.socket.remoteAddress??"unknown").replace(/^::ffff:/,""),now=Date.now();
+    const throttle=loginAttempts.get(peer);
+    if(throttle && throttle.resetAt<=now)loginAttempts.delete(peer);
+    const active=loginAttempts.get(peer);
+    if(active?.count>=10){res.setHeader("Retry-After",String(Math.max(1,Math.ceil((active.resetAt-now)/1000))));return json(res,429,{error:"Too many failed sign-in attempts; retry after the indicated delay"});}
     const email = body.email.toLowerCase();
-    const admin = db.prepare("SELECT id, email, password_hash, password_salt FROM admins WHERE email = ?").get(email);
+    const admin = db.prepare("SELECT id, email, role, password_hash, password_salt FROM admins WHERE email = ?").get(email);
     if (!admin || !verifyPassword(body.password, admin.password_salt, admin.password_hash)) {
+      const prior=loginAttempts.get(peer);
+      loginAttempts.set(peer,{count:(prior?.count??0)+1,resetAt:prior?.resetAt>now?prior.resetAt:now+15*60_000});
+      if(loginAttempts.size>10000)for(const [key,value] of loginAttempts)if(value.resetAt<=now)loginAttempts.delete(key);
       recordAudit(db, email, "admin.login_failed", "administrator", "Failed administrator login.");
       return json(res, 401, { error: "Invalid credentials" });
     }
+    loginAttempts.delete(peer);
     recordAudit(db, admin.email, "admin.login", "administrator", "Administrator logged in.");
     setCookie(res, signSession(admin, config.sessionSecret), config);
-    return json(res, 200, { email: admin.email });
+    return json(res, 200, { email: admin.email, role: admin.role });
   }
 
   if (url.pathname === "/api/agent/events" && req.method === "POST") {
-    const token = /^Bearer\s+(.+)$/i.exec(req.headers.authorization ?? "")?.[1];
-    if (!verifyAgentCredential(db, token)) return json(res, 401, { error: "Valid agent credential required" });
+    if (databaseCapacityReached(config)) return json(res,507,{error:"Local database storage limit reached; ingestion paused until retention or capacity is addressed"});
     const body = await readJson(req);
+    const siteToken = req.headers["x-sentrygate-asset-credential"];
+    const token = /^Bearer\s+(.+)$/i.exec(req.headers.authorization ?? "")?.[1];
+    if (siteToken !== undefined ? !verifyAssetCredential(db, body?.assetId, siteToken) : !verifyAgentCredential(db, token)) return json(res, 401, { error: "Valid credential for this asset required" });
     const invalidEvent = validateGatewayEvent(body);
     if (invalidEvent) return json(res, 400, { error: invalidEvent });
     if (!db.prepare("SELECT 1 FROM assets WHERE id = ?").get(body.assetId)) return json(res, 400, { error: "Event asset does not exist" });
@@ -213,6 +243,7 @@ async function route(req, res, db, config) {
   }
 
   if (url.pathname === "/api/application/events" && req.method === "POST") {
+    if (databaseCapacityReached(config)) return json(res,507,{error:"Local database storage limit reached; ingestion paused until retention or capacity is addressed"});
     const token = /^Bearer\s+(.+)$/i.exec(req.headers.authorization ?? "")?.[1] ?? "";
     if (!verifyAgentCredential(db, token)) return json(res, 401, { error: "Valid event-ingestion credential required" });
     const body = await readJson(req);
@@ -228,8 +259,12 @@ async function route(req, res, db, config) {
   if (url.pathname.startsWith("/api/") && !admin) {
     return json(res, 401, { error: "Authentication required" });
   }
+  if (url.pathname.startsWith("/api/") && admin && !["GET","HEAD"].includes(req.method)) {
+    const origin=req.headers.origin;
+    if(origin){try{if(!sameRequestOrigin(origin,req))return json(res,403,{error:"Cross-origin administrator request rejected"});}catch{return json(res,403,{error:"Invalid request origin"});}}
+  }
   if (url.pathname.startsWith("/api/") && admin.role !== "owner") {
-    const analystWrite = admin.role === "security_analyst" && ((req.method === "POST" && /^\/api\/incidents\/[a-f0-9-]+\/notes$/.test(url.pathname)) || (req.method === "PATCH" && /^\/api\/incidents\/[a-f0-9-]+\/status$/.test(url.pathname)) || (req.method === "POST" && url.pathname === "/api/action-policies"));
+    const analystWrite = admin.role === "security_analyst" && ((req.method === "POST" && /^\/api\/incidents\/[a-f0-9-]+\/notes$/.test(url.pathname)) || (req.method === "PATCH" && /^\/api\/incidents\/[a-f0-9-]+\/status$/.test(url.pathname)) || (req.method === "POST" && url.pathname === "/api/action-policies") || (req.method === "POST" && /^\/api\/events\/\d+\/false-positive$/.test(url.pathname)));
     if (!(["GET", "HEAD"].includes(req.method)) && !analystWrite) return json(res, 403, { error: "This administrator role cannot perform that action" });
   }
 
@@ -292,11 +327,14 @@ async function route(req, res, db, config) {
       if (paused) return json(res, 409, { error: "Emergency pause is active; action approval is disabled" });
       if (Date.parse(action.expires_at) <= Date.now()) return json(res, 409, { error: "Proposed action has expired; create a fresh proposal" });
       const device = action.target_type === "device" ? db.prepare("SELECT * FROM device_agents WHERE device_id=? AND revoked_at IS NULL AND is_demo=0").get(action.target_id) : null;
+      const incidentAsset = db.prepare("SELECT asset_id FROM incidents WHERE id=?").get(action.incident_id)?.asset_id;
+      if (action.target_type === "device" && (!device || Number(device.asset_id) !== Number(incidentAsset))) return json(res, 409, { error: "Action destination device no longer matches the incident asset" });
+      if (action.target_type === "website" && Number(action.target_id) !== Number(incidentAsset)) return json(res, 409, { error: "Action destination website does not match the incident asset" });
       const unsafe = validateActionTarget(db, action, device ? JSON.parse(device.backend_addresses ?? "[]") : []);
       if (unsafe) return json(res, 400, { error: unsafe });
       const now = new Date().toISOString();
       if (action.target_type === "website") {
-        const asset = db.prepare("SELECT id FROM assets WHERE id=? AND type='website'").get(Number(action.target_id));
+        const asset = db.prepare("SELECT id FROM assets WHERE id=? AND type='website' AND removed_at IS NULL").get(Number(action.target_id));
         if (!asset || db.prepare("SELECT 1 FROM gateway_allowlist WHERE asset_id=? AND ip=?").get(asset.id, action.target_address)) return json(res, 400, { error: "Website target is unavailable or the source is now allowlisted" });
         const existingBlock = db.prepare("SELECT action_id FROM gateway_ip_blocks WHERE asset_id=? AND ip=? AND expires_at>? LIMIT 1").get(asset.id, action.target_address, now);
         if (existingBlock) return json(res, 409, { error: `This website already has an active SentryGate block from action ${existingBlock.action_id}` });
@@ -438,7 +476,12 @@ async function route(req, res, db, config) {
     } catch { return json(res, 400, { error: "Could not resolve the configured backend address; refusing an unsafe rule preview" }); }
     const invalid = validateFirewallRule(body, db, Date.now(), backendAddresses);
     if (invalid) return json(res, 400, { error: invalid });
-    if (body.incidentId != null && (typeof body.incidentId !== "string" || !db.prepare("SELECT 1 FROM incidents WHERE id=?").get(body.incidentId))) return json(res, 400, { error: "incidentId must reference an existing incident" });
+    if (body.incidentId != null) {
+      const incident = typeof body.incidentId === "string" ? db.prepare("SELECT asset_id FROM incidents WHERE id=?").get(body.incidentId) : null;
+      const deviceAsset = db.prepare("SELECT asset_id FROM device_agents WHERE device_id=? AND revoked_at IS NULL").get(body.deviceId);
+      if (!incident) return json(res, 400, { error: "incidentId must reference an existing incident" });
+      if (!deviceAsset || Number(incident.asset_id) !== Number(deviceAsset.asset_id)) return json(res, 409, { error: "Firewall rule device must belong to the incident's affected asset" });
+    }
     try {
       if (backendAddresses.some((address) => overlaps(body.remoteCidr, address))) return json(res, 400, { error: "Rule overlaps a resolved SentryGate backend address" });
     } catch { return json(res, 500, { error: "Configured API address is invalid" }); }
@@ -501,15 +544,24 @@ async function route(req, res, db, config) {
     const body = await readJson(req);
     const invalid = validateDeviceEnrollment(body);
     if (invalid) return json(res, 400, { error: invalid });
-    const linkedAssetId = body.assetId === undefined || body.assetId === "" || body.assetId === null ? null : Number(body.assetId);
-    if (linkedAssetId !== null && !db.prepare("SELECT 1 FROM assets WHERE id=? AND type='computer'").get(linkedAssetId)) return json(res, 400, { error: "Linked asset must be a registered computer" });
+    let linkedAssetId = body.assetId === undefined || body.assetId === "" || body.assetId === null ? null : Number(body.assetId);
+    if (linkedAssetId !== null && !db.prepare("SELECT 1 FROM assets WHERE id=? AND type='computer' AND removed_at IS NULL").get(linkedAssetId)) return json(res, 400, { error: "Linked asset must be an active registered computer" });
+    if (linkedAssetId !== null && db.prepare("SELECT 1 FROM device_agents WHERE asset_id=? AND revoked_at IS NULL").get(linkedAssetId)) return json(res, 409, { error: "A computer asset can be linked to only one active agent" });
     const deviceId = crypto.randomUUID();
     const credential = crypto.randomBytes(32).toString("base64url");
     const enrolledAt = new Date().toISOString();
+    if (linkedAssetId === null) {
+      const created = db.prepare(`INSERT INTO assets (name,type,owner,status,address,description,created_at) VALUES (?,'computer',?,'unknown',?,?,?)`)
+        .run(body.name.trim(), admin.email, body.hostname.trim(), "Enrolled Windows computer", enrolledAt);
+      linkedAssetId = Number(created.lastInsertRowid);
+    }
     db.prepare(`INSERT INTO device_agents (device_id,name,hostname,os_version,agent_version,credential_hash,enrolled_at,asset_id)
       VALUES (?,?,?,?,?,?,?,?)`).run(deviceId, body.name.trim(), body.hostname.trim(), body.osVersion.trim(), body.agentVersion.trim(), tokenHash(credential), enrolledAt, linkedAssetId);
+    const device = db.prepare("SELECT * FROM device_agents WHERE device_id=?").get(deviceId);
+    queueDeviceConfig(db, device, enrolledAt);
     recordAudit(db, admin.email, "device.enrolled", `device:${deviceId}`, `Enrolled Windows device ${body.name.trim()}.`);
-    return json(res, 201, { deviceId, credential, enrolledAt, shownOnce: true });
+    recordAudit(db, admin.email, "asset.device_linked", `asset:${linkedAssetId}`, `Linked Windows agent ${deviceId} to its dedicated computer asset.`);
+    return json(res, 201, { deviceId, assetId: linkedAssetId, credential, enrolledAt, shownOnce: true });
   }
 
   if (url.pathname === "/api/devices" && req.method === "GET") {
@@ -520,7 +572,8 @@ async function route(req, res, db, config) {
       health_detail AS healthDetail,
       collection_processes AS collectionProcesses,collection_connections AS collectionConnections,
       collection_interval_seconds AS collectionIntervalSeconds,outbound_connection_threshold AS outboundConnectionThreshold,
-      retained_days AS retainedDays,is_demo AS isDemo FROM device_agents ORDER BY name`).all();
+      retained_days AS retainedDays,is_demo AS isDemo,(SELECT status FROM device_config_updates q WHERE q.device_id=device_agents.device_id ORDER BY version DESC LIMIT 1) AS configStatus,
+      (SELECT attempts FROM device_config_updates q WHERE q.device_id=device_agents.device_id ORDER BY version DESC LIMIT 1) AS configAttempts FROM device_agents ORDER BY name`).all();
     return json(res, 200, devices);
   }
 
@@ -531,9 +584,10 @@ async function route(req, res, db, config) {
     const invalid = validateDeviceSettings(body);
     if (invalid) return json(res, 400, { error: invalid });
     if (!db.prepare("SELECT 1 FROM device_agents WHERE device_id=?").get(id)) return json(res, 404, { error: "Device not found" });
-    db.prepare(`UPDATE device_agents SET collection_processes=?,collection_connections=?,collection_interval_seconds=?,
+    db.prepare(`UPDATE device_agents SET collection_processes=?,collection_connections=?,collection_interval_seconds=?,config_version=config_version+1,
       outbound_connection_threshold=?,retained_days=? WHERE device_id=?`)
       .run(+body.collectProcesses, +body.collectConnections, body.intervalSeconds, body.outboundConnectionThreshold, body.retainedDays, id);
+    queueDeviceConfig(db, db.prepare("SELECT * FROM device_agents WHERE device_id=?").get(id), new Date().toISOString());
     recordAudit(db, admin.email, "device.settings_updated", `device:${id}`, "Updated collection and retention settings.");
     return json(res, 200, { saved: true });
   }
@@ -558,7 +612,7 @@ async function route(req, res, db, config) {
   if (deviceDetail && req.method === "GET") {
     const device = db.prepare(`SELECT device_id AS deviceId,name,asset_id AS assetId,(SELECT name FROM assets WHERE id=device_agents.asset_id) AS assetName,hostname,os_version AS osVersion,agent_version AS agentVersion,
       enrolled_at AS enrolledAt,last_heartbeat AS lastHeartbeat,CASE WHEN revoked_at IS NOT NULL THEN 'revoked'
-      WHEN last_heartbeat IS NULL OR datetime(last_heartbeat) < datetime('now', '-' || (collection_interval_seconds * 3) || ' seconds') THEN 'stale'
+      WHEN last_heartbeat IS NULL OR datetime(last_heartbeat) < datetime('now', '-' || (collection_interval_seconds * 3) || ' seconds') THEN 'offline'
       ELSE health_status END AS healthStatus,health_detail AS healthDetail,revoked_at AS revokedAt,is_demo AS isDemo,
       collection_processes AS collectionProcesses,collection_connections AS collectionConnections,collection_interval_seconds AS collectionIntervalSeconds,
       outbound_connection_threshold AS outboundConnectionThreshold,retained_days AS retainedDays
@@ -569,6 +623,8 @@ async function route(req, res, db, config) {
   }
 
   if (url.pathname === "/api/logout" && req.method === "POST") {
+    const raw=parseCookies(req.headers.cookie??"")[cookieName],session=verifySession(raw,config.sessionSecret);
+    if(session)db.prepare("INSERT OR IGNORE INTO revoked_sessions(session_id,expires_at,revoked_at) VALUES(?,?,?)").run(session.jti,session.exp,new Date().toISOString());
     recordAudit(db, admin.email, "admin.logout", "administrator", "Administrator logged out.");
     clearCookie(res, config);
     return empty(res, 204);
@@ -585,8 +641,40 @@ async function route(req, res, db, config) {
     });
   }
 
+  if(url.pathname==="/api/pilot/metrics"&&req.method==="GET"){
+    const days=Number(url.searchParams.get("days")??7);
+    if(!Number.isInteger(days)||days<1||days>90)return json(res,400,{error:"Pilot metrics window must be 1 to 90 days"});
+    return json(res,200,pilotMetrics(db,{days}));
+  }
+
+  if(url.pathname==="/api/pilot/report"&&req.method==="GET"){
+    const days=Number(url.searchParams.get("days")??7),assetIdRaw=url.searchParams.get("assetId");
+    if(!Number.isInteger(days)||days<1||days>90||assetIdRaw!==null&&!/^\d+$/.test(assetIdRaw))return json(res,400,{error:"Invalid report scope"});
+    const report=generatePilotReport(db,{days,...(assetIdRaw===null?{}:{assetId:Number(assetIdRaw)})});
+    recordAudit(db,admin.email,"pilot.report_exported","pilot",`Exported controlled-pilot report for ${days} days${assetIdRaw?` and asset ${assetIdRaw}`:""}.`);
+    res.setHeader("Content-Disposition",`attachment; filename=sentrygate-pilot-${new Date().toISOString().slice(0,10)}.json`);
+    return json(res,200,report);
+  }
+
+  const falsePositiveRoute=url.pathname.match(/^\/api\/events\/(\d+)\/false-positive$/);
+  if(falsePositiveRoute&&req.method==="POST"){
+    const eventId=Number(falsePositiveRoute[1]),body=await readJson(req);
+    if(typeof body.falsePositive!=="boolean")return json(res,400,{error:"falsePositive must be a boolean"});
+    const event=db.prepare("SELECT id,source,detection_rule FROM events WHERE id=?").get(eventId);
+    if(!event||event.source!=="website-gateway"||event.detection_rule==="none"||event.detection_rule==="allowlist")return json(res,404,{error:"Reviewable gateway detection event not found"});
+    const now=new Date().toISOString();
+    db.prepare("UPDATE events SET false_positive=?,reviewed_by=?,reviewed_at=? WHERE id=?").run(body.falsePositive?1:0,admin.email,now,eventId);
+    recordAudit(db,admin.email,body.falsePositive?"pilot.false_positive_marked":"pilot.false_positive_cleared",`event:${eventId}`,`Administrator ${body.falsePositive?"marked this detection as a false positive":"cleared the false-positive label"}; original evidence was preserved.`);
+    return json(res,200,{eventId,falsePositive:body.falsePositive,reviewedBy:admin.email,reviewedAt:now});
+  }
+
   if (url.pathname === "/api/assets" && req.method === "GET") {
-    return json(res, 200, db.prepare("SELECT id, name, type, owner, status, address, description, created_at AS createdAt FROM assets ORDER BY name").all());
+    return json(res, 200, db.prepare(`SELECT a.id,a.name,a.type,a.owner,a.status,a.address,a.description,a.created_at AS createdAt,
+      a.removed_at AS removedAt,d.device_id AS deviceId,COALESCE(d.agent_version,g.gateway_version) AS version,COALESCE(d.last_heartbeat,g.last_heartbeat) AS lastHeartbeat,
+      CASE WHEN d.device_id IS NOT NULL THEN CASE WHEN d.revoked_at IS NOT NULL THEN 'revoked' WHEN d.last_heartbeat IS NULL OR datetime(d.last_heartbeat)<datetime('now','-' || (d.collection_interval_seconds*3) || ' seconds') THEN 'offline' ELSE d.health_status END
+      WHEN a.type='website' THEN CASE WHEN a.upstream_url='' THEN 'not-configured' WHEN g.last_heartbeat IS NULL OR datetime(g.last_heartbeat)<datetime('now','-90 seconds') THEN 'offline' ELSE g.health_status END ELSE a.status END AS connectionStatus,
+      (SELECT status FROM device_config_updates q WHERE q.device_id=d.device_id ORDER BY version DESC LIMIT 1) AS configStatus
+      FROM assets a LEFT JOIN device_agents d ON d.asset_id=a.id LEFT JOIN website_gateway_status g ON g.asset_id=a.id WHERE a.removed_at IS NULL ORDER BY a.name`).all());
   }
 
   if (url.pathname === "/api/assets" && req.method === "POST") {
@@ -598,8 +686,63 @@ async function route(req, res, db, config) {
       VALUES (?, ?, ?, 'healthy', ?, ?, ?)`)
       .run(body.name.trim(), body.type, admin.email, body.address.trim(), body.description.trim(), createdAt);
     if (body.type === "website") db.prepare("INSERT INTO gateway_rules (asset_id, updated_at) VALUES (?, ?)").run(Number(result.lastInsertRowid), createdAt);
+    if (body.type === "website") rotateAssetCredential(db, config.sessionSecret, Number(result.lastInsertRowid));
     recordAudit(db, admin.email, "asset.created", `asset:${result.lastInsertRowid}`, `Registered ${body.type} asset ${body.name.trim()}.`);
     return json(res, 201, { id: Number(result.lastInsertRowid) });
+  }
+
+  const websiteCredential = url.pathname.match(/^\/api\/assets\/(\d+)\/credential\/rotate$/);
+  if (websiteCredential && req.method === "POST") {
+    const id=Number(websiteCredential[1]),asset=db.prepare("SELECT id,name FROM assets WHERE id=? AND type='website' AND removed_at IS NULL").get(id);
+    if(!asset)return json(res,404,{error:"Active website asset not found"});
+    const credential=rotateAssetCredential(db,config.sessionSecret,id);
+    recordAudit(db,admin.email,"asset.credential_rotated",`asset:${id}`,`Rotated the gateway credential for website ${asset.name}.`);
+    return json(res,200,{credential,assetId:id,shownOnce:true});
+  }
+
+  const assetDetail = url.pathname.match(/^\/api\/assets\/(\d+)$/);
+  if (assetDetail && req.method === "GET") {
+    const id = Number(assetDetail[1]);
+    const asset = db.prepare(`SELECT a.*,d.device_id AS deviceId,COALESCE(d.agent_version,g.gateway_version) AS version,COALESCE(d.last_heartbeat,g.last_heartbeat) AS lastHeartbeat,
+      CASE WHEN d.device_id IS NOT NULL THEN d.health_status ELSE g.health_status END AS healthStatus,
+      d.health_detail AS healthDetail,d.revoked_at AS revokedAt,d.collection_interval_seconds AS heartbeatInterval
+      FROM assets a LEFT JOIN device_agents d ON d.asset_id=a.id LEFT JOIN website_gateway_status g ON g.asset_id=a.id WHERE a.id=? AND a.removed_at IS NULL`).get(id);
+    if (!asset) return json(res, 404, { error: "Asset not found" });
+    const recentEvents = db.prepare("SELECT id,source,action,reason,evidence,severity,observed_source_ip,request_details,process_details,detection_rule,created_at AS createdAt FROM events WHERE asset_id=? ORDER BY created_at DESC LIMIT 50").all(id);
+    const activeRules = asset.deviceId ? db.prepare("SELECT id,status,remote_cidr AS remoteCidr,protocol,local_port AS localPort,expires_at AS expiresAt,failure FROM firewall_rules WHERE device_id=? AND status IN ('approved','active','failed','removing','expired') ORDER BY created_at DESC").all(asset.deviceId) : [];
+    const pendingConfig = asset.deviceId ? db.prepare("SELECT version,status,attempts,last_attempt_at AS lastAttemptAt,detail FROM device_config_updates WHERE device_id=? ORDER BY version DESC LIMIT 1").get(asset.deviceId) : null;
+    return json(res, 200, { asset, recentEvents, activeRules, pendingConfig, recentAlerts: db.prepare("SELECT id,title,severity,status,created_at AS createdAt FROM alerts WHERE asset_id=? ORDER BY created_at DESC LIMIT 10").all(id) });
+  }
+
+  const assetRemoval = url.pathname.match(/^\/api\/assets\/(\d+)\/remove$/);
+  if (assetRemoval && req.method === "POST") {
+    const id = Number(assetRemoval[1]), body = await readJson(req);
+    if (body.confirmed !== true) return json(res, 400, { error: "Explicit confirmation is required" });
+    const asset = db.prepare("SELECT * FROM assets WHERE id=? AND removed_at IS NULL").get(id);
+    if (!asset) return json(res, 404, { error: "Asset not found" });
+    const device = db.prepare("SELECT * FROM device_agents WHERE asset_id=? AND revoked_at IS NULL").get(id);
+    const outstanding = device ? db.prepare("SELECT id,status FROM firewall_rules WHERE device_id=? AND status IN ('proposed','approved','active','failed','removing','expired')").all(device.device_id) : [];
+    if (outstanding.length) return json(res, 409, { error: "Asset has SentryGate-owned firewall rules that must be rolled back and confirmed removed before asset removal", rules: outstanding });
+    const activeGatewayActions = db.prepare("SELECT action_id,expires_at FROM gateway_ip_blocks WHERE asset_id=?").all(id);
+    if (activeGatewayActions.length) return json(res, 409, { error: "Website asset has active SentryGate gateway actions; roll them back or wait for expiry before removal", actions: activeGatewayActions });
+    const now = new Date().toISOString();
+    db.prepare("UPDATE assets SET removed_at=?,status='removed' WHERE id=?").run(now,id);
+    if (device) db.prepare("UPDATE device_agents SET revoked_at=? WHERE device_id=?").run(now,device.device_id);
+    db.prepare("UPDATE asset_credentials SET revoked_at=? WHERE asset_id=?").run(now,id);
+    db.prepare("DELETE FROM gateway_ip_blocks WHERE asset_id=?").run(id);
+    recordAudit(db, admin.email, "asset.removed", `asset:${id}`, `Soft-removed ${asset.type} asset ${asset.name}; evidence retained${device ? ` and agent ${device.device_id} credential revoked` : ""}.`);
+    return json(res, 200, { removed: true, evidenceRetained: true, revokedDeviceId: device?.device_id ?? null });
+  }
+
+  if (url.pathname === "/api/admins" && (req.method === "GET" || req.method === "POST")) {
+    if (req.method === "GET") return json(res, 200, db.prepare("SELECT id,email,role,created_at AS createdAt FROM admins ORDER BY id").all());
+    const body = await readJson(req), validation = validateCredentials(body, true);
+    if (validation) return json(res, 400, { error: validation });
+    if (!["owner","security_analyst","read_only_viewer"].includes(body.role)) return json(res, 400, { error: "Role must be owner, security_analyst, or read_only_viewer" });
+    const email=body.email.toLowerCase(), {salt,hash}=hashPassword(body.password), now=new Date().toISOString();
+    try { const created=db.prepare("INSERT INTO admins(email,password_hash,password_salt,role,created_at) VALUES(?,?,?,?,?)").run(email,hash,salt,body.role,now);
+      recordAudit(db,admin.email,"admin.created",`admin:${created.lastInsertRowid}`,`Created ${body.role} administrator ${email}.`); return json(res,201,{id:Number(created.lastInsertRowid),email,role:body.role}); }
+    catch { return json(res,409,{error:"Administrator email already exists"}); }
   }
 
   const protectionMatch = url.pathname.match(/^\/api\/assets\/(\d+)\/protection$/);
@@ -608,7 +751,7 @@ async function route(req, res, db, config) {
     const asset = db.prepare("SELECT id,type,upstream_url AS upstreamUrl FROM assets WHERE id = ?").get(assetId);
     if (!asset || asset.type !== "website") return json(res, 404, { error: "Protected website not found" });
     if (req.method === "GET") {
-      const rule = db.prepare(`SELECT enabled,mode,rate_limit_count AS rateLimitCount,window_seconds AS windowSeconds,
+      const rule = db.prepare(`SELECT enabled,mode,failure_mode AS failureMode,rate_limit_count AS rateLimitCount,window_seconds AS windowSeconds,
         sensitive_paths_enabled AS sensitivePathsEnabled,updated_at AS updatedAt FROM gateway_rules WHERE asset_id = ?`).get(assetId);
       const allowlist = db.prepare("SELECT ip FROM gateway_allowlist WHERE asset_id = ? ORDER BY ip").all(assetId).map((row) => row.ip);
       return json(res, 200, { upstreamUrl: asset.upstreamUrl, rule, allowlist });
@@ -617,18 +760,21 @@ async function route(req, res, db, config) {
       const body = await readJson(req);
       const validation = validateProtection(body);
       if (validation) return json(res, 400, { error: validation });
-      const old = db.prepare(`SELECT mode,enabled,rate_limit_count AS rateLimitCount,window_seconds AS windowSeconds,
+      const upstream=new URL(body.upstreamUrl);
+      const loopbackUpstream=["127.0.0.1","::1","localhost"].includes(upstream.hostname.replace(/^\[|\]$/g,""));
+      if(upstream.protocol!=="https:" && (!loopbackUpstream || process.env.NODE_ENV==="production")) return json(res,400,{error:"Non-loopback website upstreams must use HTTPS; HTTP is permitted only for loopback development"});
+      const old = db.prepare(`SELECT mode,enabled,failure_mode AS failureMode,rate_limit_count AS rateLimitCount,window_seconds AS windowSeconds,
         sensitive_paths_enabled AS sensitivePathsEnabled FROM gateway_rules WHERE asset_id = ?`).get(assetId);
       const priorAllowlist = db.prepare("SELECT ip FROM gateway_allowlist WHERE asset_id = ? ORDER BY ip").all(assetId).map((row) => row.ip);
       const timestamp = new Date().toISOString();
       db.exec("BEGIN");
       try {
         db.prepare("UPDATE assets SET upstream_url = ? WHERE id = ?").run(body.upstreamUrl.trim(), assetId);
-        db.prepare(`INSERT INTO gateway_rules (asset_id,enabled,mode,rate_limit_count,window_seconds,sensitive_paths_enabled,updated_at)
-          VALUES (?,?,?,?,?,?,?) ON CONFLICT(asset_id) DO UPDATE SET enabled=excluded.enabled,mode=excluded.mode,
-          rate_limit_count=excluded.rate_limit_count,window_seconds=excluded.window_seconds,
+        db.prepare(`INSERT INTO gateway_rules (asset_id,enabled,mode,failure_mode,rate_limit_count,window_seconds,sensitive_paths_enabled,updated_at)
+          VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(asset_id) DO UPDATE SET enabled=excluded.enabled,mode=excluded.mode,
+          failure_mode=excluded.failure_mode,rate_limit_count=excluded.rate_limit_count,window_seconds=excluded.window_seconds,
           sensitive_paths_enabled=excluded.sensitive_paths_enabled,updated_at=excluded.updated_at`)
-          .run(assetId, body.enabled ? 1 : 0, body.mode, body.rateLimitCount, body.windowSeconds, body.sensitivePathsEnabled ? 1 : 0, timestamp);
+          .run(assetId, body.enabled ? 1 : 0, body.mode, body.failureMode ?? old?.failureMode ?? "open", body.rateLimitCount, body.windowSeconds, body.sensitivePathsEnabled ? 1 : 0, timestamp);
         db.prepare("DELETE FROM gateway_allowlist WHERE asset_id = ?").run(assetId);
         const insertAllowlist = db.prepare("INSERT INTO gateway_allowlist (asset_id,ip,created_at) VALUES (?,?,?)");
         for (const ip of body.allowlist) insertAllowlist.run(assetId, ip, timestamp);
@@ -637,6 +783,7 @@ async function route(req, res, db, config) {
       const changed = [];
       if (asset.upstreamUrl !== body.upstreamUrl.trim()) changed.push("upstream URL");
       if (old?.mode !== body.mode || Number(old?.enabled) !== Number(body.enabled)) changed.push("rule mode/enabled state");
+      if (old?.failureMode !== (body.failureMode ?? old?.failureMode ?? "open")) changed.push("gateway failure behavior");
       if (old?.rateLimitCount !== body.rateLimitCount || old?.windowSeconds !== body.windowSeconds) changed.push("rate limit");
       if (Number(old?.sensitivePathsEnabled) !== Number(body.sensitivePathsEnabled)) changed.push("sensitive-path rule");
       if (changed.length) recordAudit(db, admin.email, "protection.updated", `asset:${assetId}`, `Changed ${changed.join(", ")}.`);
@@ -722,6 +869,7 @@ async function route(req, res, db, config) {
     const events = db.prepare(`SELECT events.id, events.asset_id AS assetId, assets.name AS assetName, events.source, events.category, events.action, events.reason, events.evidence,
       events.observed_source_ip AS observedSourceIp, events.request_details AS requestDetails, events.process_details AS processDetails,
       events.severity, events.method, events.request_path AS path, events.user_agent AS userAgent, events.response_status AS responseStatus,
+      events.false_positive AS falsePositive,events.reviewed_by AS reviewedBy,events.reviewed_at AS reviewedAt,
       events.detection_rule AS detectionRule, events.device_id AS deviceId, device_agents.name AS deviceName, events.created_at AS createdAt FROM events LEFT JOIN assets ON assets.id = events.asset_id LEFT JOIN device_agents ON device_agents.device_id=events.device_id
       ${where} ORDER BY events.created_at DESC LIMIT 500`).all(...values);
     return json(res, 200, events);
@@ -744,10 +892,12 @@ async function route(req, res, db, config) {
     const cutoff = new Date(Date.now() - rawEventDays * 86_400_000).toISOString();
     const reportCutoff = new Date(Date.now() - reportDays * 86_400_000).toISOString();
     const deletedEvents = db.prepare("DELETE FROM events WHERE created_at < ?").run(cutoff).changes;
+    const deletedGatewayMetrics = db.prepare("DELETE FROM gateway_request_metrics WHERE observed_at < ?").run(cutoff).changes;
     const deletedReports = db.prepare("DELETE FROM incident_reports WHERE expires_at<=? OR created_at<?").run(new Date().toISOString(), reportCutoff).changes;
     const deletedAudit = db.prepare("DELETE FROM audit_log WHERE created_at < ?").run(cutoff).changes;
-    recordAudit(db, admin.email, "retention.run", "local-data", `Deleted ${deletedEvents} event rows, ${deletedReports} report snapshots, and ${deletedAudit} audit rows; raw retention ${rawEventDays} days, report retention ${reportDays} days.`);
-    return json(res, 200, { deletedEvents, deletedReports, deletedAudit, cutoff, reportCutoff });
+    if(deletedEvents||deletedGatewayMetrics||deletedReports||deletedAudit)db.exec("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;");
+    recordAudit(db, admin.email, "retention.run", "local-data", `Deleted ${deletedEvents} event rows, ${deletedGatewayMetrics} gateway timing rows, ${deletedReports} report snapshots, and ${deletedAudit} audit rows; raw retention ${rawEventDays} days, report retention ${reportDays} days.`);
+    return json(res, 200, { deletedEvents, deletedGatewayMetrics, deletedReports, deletedAudit, cutoff, reportCutoff });
   }
 
   if (url.pathname.startsWith("/api/")) {
@@ -785,15 +935,24 @@ function currentAdmin(req, db, config) {
   if (!session) {
     return null;
   }
-  return db.prepare("SELECT id, email FROM admins WHERE id = ?").get(Number(session.sub)) ?? null;
+  if(db.prepare("SELECT 1 FROM revoked_sessions WHERE session_id=?").get(session.jti))return null;
+  return db.prepare("SELECT id, email, role FROM admins WHERE id = ?").get(Number(session.sub)) ?? null;
+}
+
+function queueDeviceConfig(db, device, createdAt) {
+  const version = Number(device.config_version);
+  const config = { collectProcesses: Boolean(device.collection_processes), collectConnections: Boolean(device.collection_connections),
+    intervalSeconds: device.collection_interval_seconds, outboundConnectionThreshold: device.outbound_connection_threshold, retainedDays: device.retained_days };
+  db.prepare("INSERT INTO device_config_updates(device_id,version,config_json,status,created_at) VALUES(?,?,?,'pending',?) ON CONFLICT(device_id,version) DO UPDATE SET config_json=excluded.config_json")
+    .run(device.device_id, version, JSON.stringify(config), createdAt);
 }
 
 function validateCredentials(body, setup) {
   if (!body || typeof body.email !== "string" || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(body.email) || body.email.length > 254) {
     return "A valid email address is required";
   }
-  if (typeof body.password !== "string" || body.password.length < (setup ? 12 : 1)) {
-    return setup ? "Password must be at least 12 characters" : "Password is required";
+  if (typeof body.password !== "string" || body.password.length < (setup ? 12 : 1) || body.password.length > 1024) {
+    return setup ? "Password must be 12 to 1024 characters" : "Password must be 1 to 1024 characters";
   }
   return null;
 }
@@ -815,6 +974,7 @@ function validateProtection(body) {
     if (!["http:", "https:"].includes(upstream.protocol) || !upstream.hostname || upstream.username || upstream.password || upstream.hash) return "Upstream must be HTTP or HTTPS without embedded credentials or a fragment";
   } catch { return "A valid upstream URL is required"; }
   if (typeof body.enabled !== "boolean" || !["observe", "challenge-ready", "block"].includes(body.mode)) return "Rule enabled state or mode is invalid";
+  if (body.failureMode !== undefined && !["open","closed"].includes(body.failureMode)) return "Failure behavior must be open or closed";
   if (!Number.isInteger(body.rateLimitCount) || body.rateLimitCount < 1 || body.rateLimitCount > 100000) return "Rate limit must be from 1 to 100000 requests";
   if (!Number.isInteger(body.windowSeconds) || body.windowSeconds < 1 || body.windowSeconds > 3600) return "Rate window must be from 1 to 3600 seconds";
   if (typeof body.sensitivePathsEnabled !== "boolean") return "Sensitive-path enabled state must be boolean";
@@ -875,7 +1035,7 @@ function validateDeviceEnrollment(body) {
 function validateActionPolicy(body, db) {
   if (!body || typeof body !== "object") return "Policy details are required";
   if (typeof body.name !== "string" || !body.name.trim() || body.name.length > 100) return "Policy name is required (maximum 100 characters)";
-  if (!Number.isInteger(body.assetId) || !db.prepare("SELECT 1 FROM assets WHERE id=?").get(body.assetId)) return "Select an existing affected asset";
+  if (!Number.isInteger(body.assetId) || !db.prepare("SELECT 1 FROM assets WHERE id=? AND removed_at IS NULL").get(body.assetId)) return "Select an existing active affected asset";
   if (body.detectionRule !== undefined && (typeof body.detectionRule !== "string" || body.detectionRule.length > 100 || !/^[a-zA-Z0-9_.:*:-]+$/.test(body.detectionRule))) return "Detection rule must be a rule identifier or *";
   if (!['low', 'medium', 'high', 'critical'].includes(body.minimumSeverity)) return "Minimum severity must be low, medium, high, or critical";
   if (!Number.isInteger(body.minimumEventCount) || body.minimumEventCount < 2 || body.minimumEventCount > 100) return "Minimum event count must be from 2 to 100";
@@ -885,10 +1045,11 @@ function validateActionPolicy(body, db) {
   if (body.targetType === "device") {
     const target = db.prepare("SELECT asset_id FROM device_agents WHERE device_id=? AND revoked_at IS NULL AND is_demo=0").get(String(body.targetId));
     if (!target) return "Choose an enrolled, active Windows device";
+    if (Number(target.asset_id) !== Number(body.assetId)) return "Destination computer must be the same asset as the policy evidence";
     if (!['TCP', 'UDP'].includes(body.protocol) || !Number.isInteger(body.localPort) || body.localPort < 1 || body.localPort > 65535) return "Device actions require TCP or UDP and a valid destination port";
   } else {
-    const target = db.prepare("SELECT type FROM assets WHERE id=?").get(Number(body.targetId));
-    if (!target || target.type !== "website") return "Choose a registered protected website destination";
+    const target = db.prepare("SELECT type FROM assets WHERE id=? AND removed_at IS NULL").get(Number(body.targetId));
+    if (!target || target.type !== "website" || Number(body.targetId) !== Number(body.assetId)) return "Website destination must be the same active asset as the policy evidence";
   }
   return null;
 }
@@ -970,13 +1131,22 @@ function empty(res, status) {
 
 function setCookie(res, token, config) {
   const secure = config.cookieSecure ? "; Secure" : "";
-  res.setHeader("Set-Cookie", `${cookieName}=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=28800${secure}`);
+  res.setHeader("Set-Cookie", `${cookieName}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800${secure}`);
 }
 
 function clearCookie(res, config) {
   const secure = config.cookieSecure ? "; Secure" : "";
-  res.setHeader("Set-Cookie", `${cookieName}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0${secure}`);
+  res.setHeader("Set-Cookie", `${cookieName}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${secure}`);
 }
+
+function databaseCapacityReached(config) {
+  const total=databaseBytes(config.dbPath);
+  if(total<config.maxDbBytes)return false;
+  logOperational("error","storage.limit_reached",{bytes:total,limitBytes:config.maxDbBytes});
+  return true;
+}
+
+function sameRequestOrigin(origin,req){const parsed=new URL(origin),scheme=req.socket.encrypted?"https:":"http:";return parsed.protocol===scheme&&parsed.host===req.headers.host&&!parsed.username&&!parsed.password;}
 
 function parseCookies(header) {
   return Object.fromEntries(

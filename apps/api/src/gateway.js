@@ -1,26 +1,57 @@
 import http from "node:http";
 import https from "node:https";
+import fs from "node:fs";
 import net from "node:net";
 import { randomUUID } from "node:crypto";
 import { URL } from "node:url";
-import { ensureAgentCredential } from "./agent-credentials.js";
+import { ensureAssetCredential } from "./agent-credentials.js";
 import { expireGatewayActions } from "./actions.js";
+import { logOperational } from "./logger.js";
+import { performance } from "node:perf_hooks";
 
 const hopHeaders = new Set(["connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "forwarded"]);
+const gatewayVersion = "0.7.0";
 
 export function createGatewayServer(db, config) {
   const requestsByClient = new Map();
-  const server = http.createServer((req, res) => {
+  const handler=(req, res) => {
+    const started=performance.now();
+    res.once("finish",()=>{
+      const route=String(req.url??"").match(/^\/site\/(\d+)(?:\/|\?|$)/);
+      if(!route)return;
+      try{
+        const event=req.sentryEventId?db.prepare("SELECT id FROM events WHERE source_event_id=?").get(req.sentryEventId):null;
+        db.prepare("INSERT INTO gateway_request_metrics(asset_id,event_id,observed_at,duration_ms,upstream_error) VALUES(?,?,?,?,?)")
+          .run(Number(route[1]),event?.id??null,new Date().toISOString(),Math.max(0,performance.now()-started),res.statusCode>=500?1:0);
+      }catch(error){logOperational("error","gateway.metrics_write_failed",{code:error.code??error.name??"Error"});}
+    });
     handleRequest(req, res, db, config, requestsByClient).catch((error) => {
-      if (!res.headersSent) sendText(res, 500, "Gateway error");
+      logOperational("error","gateway.request_failed",{code:error.code??error.name??"Error"});
+      if (!res.headersSent) sendText(res, 502, "Gateway temporarily unavailable");
       else res.destroy(error);
     });
-  });
+  };
+  const server=config.tlsCertPath
+    ? https.createServer({cert:fs.readFileSync(config.tlsCertPath),key:fs.readFileSync(config.tlsKeyPath),minVersion:"TLSv1.2"},handler)
+    : http.createServer(handler);
   server.on("upgrade", (req, socket) => {
     recordUnsupportedUpgrade(req, socket, db, config).catch(() => {
       socket.end("HTTP/1.1 501 Not Implemented\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
     });
   });
+  const heartbeat = () => {
+    try {
+      const now = new Date().toISOString();
+      db.prepare(`INSERT INTO website_gateway_status(asset_id,gateway_version,last_heartbeat,health_status)
+        SELECT id,?,?, 'healthy' FROM assets WHERE type='website' AND removed_at IS NULL
+        ON CONFLICT(asset_id) DO UPDATE SET gateway_version=excluded.gateway_version,last_heartbeat=excluded.last_heartbeat,health_status='healthy'`)
+        .run(gatewayVersion,now);
+    } catch(error) { logOperational("error","gateway.heartbeat_failed",{code:error.code??error.name??"Error"}); }
+  };
+  server.on("listening", heartbeat);
+  const heartbeatTimer=setInterval(heartbeat,30_000);
+  heartbeatTimer.unref();
+  server.on("close",()=>clearInterval(heartbeatTimer));
   return server;
 }
 
@@ -28,7 +59,7 @@ async function recordUnsupportedUpgrade(req, socket, db, config) {
   const url = new URL(req.url ?? "/", "http://sentrygate.local");
   const match = url.pathname.match(/^\/site\/(\d+)(\/.*)?$/);
   const assetId = match ? Number(match[1]) : 0;
-  const asset = assetId ? db.prepare("SELECT id,type FROM assets WHERE id = ?").get(assetId) : null;
+  const asset = assetId ? db.prepare("SELECT id,type FROM assets WHERE id = ? AND removed_at IS NULL").get(assetId) : null;
   if (asset?.type === "website") {
     const sourceIp = observedClientIp(req, trustedProxyList(db));
     const timestamp = new Date().toISOString();
@@ -46,11 +77,11 @@ async function handleRequest(req, res, db, config, requestsByClient) {
 
   const assetId = Number(route[1]);
   const sitePath = route[2] || "/";
-  const asset = db.prepare("SELECT id, name, type, upstream_url AS upstreamUrl FROM assets WHERE id = ?").get(assetId);
+  const asset = db.prepare("SELECT id, name, type, upstream_url AS upstreamUrl FROM assets WHERE id = ? AND removed_at IS NULL").get(assetId);
   if (!asset || asset.type !== "website") return sendText(res, 404, "Protected website not found");
-  const rule = db.prepare(`SELECT enabled, mode, rate_limit_count AS rateLimitCount, window_seconds AS windowSeconds,
+  const rule = db.prepare(`SELECT enabled, mode, failure_mode AS failureMode, rate_limit_count AS rateLimitCount, window_seconds AS windowSeconds,
     sensitive_paths_enabled AS sensitivePathsEnabled FROM gateway_rules WHERE asset_id = ?`).get(assetId)
-    ?? { enabled: 1, mode: "observe", rateLimitCount: 120, windowSeconds: 60, sensitivePathsEnabled: 1 };
+    ?? { enabled: 1, mode: "observe", failureMode: "open", rateLimitCount: 120, windowSeconds: 60, sensitivePathsEnabled: 1 };
   const sourceIp = observedClientIp(req, trustedProxyList(db));
   const allowlisted = Boolean(db.prepare("SELECT 1 FROM gateway_allowlist WHERE asset_id = ? AND ip = ?").get(assetId, sourceIp));
   expireGatewayActions(db);
@@ -59,8 +90,8 @@ async function handleRequest(req, res, db, config, requestsByClient) {
   const isRateLimited = Number(rule.enabled) === 1 && !allowlisted && rateExceeded(requestsByClient, assetId, sourceIp, Number(rule.rateLimitCount), Number(rule.windowSeconds));
   const detectionRule = allowlisted ? "allowlist" : approvedBlock ? "approved_block" : isSensitive ? "sensitive_path" : isRateLimited ? "rate_limit" : "none";
   const isDetection = detectionRule !== "none" && detectionRule !== "allowlist";
-  const blocked = approvedBlock || (isDetection && rule.mode === "block");
-  const action = allowlisted ? "allowlisted" : blocked ? "blocked" : isDetection ? (rule.mode === "challenge-ready" ? "challenge-ready" : "observed") : "forwarded";
+  let blocked = approvedBlock || (isDetection && rule.mode === "block");
+  let action = allowlisted ? "allowlisted" : blocked ? "blocked" : isDetection ? (rule.mode === "challenge-ready" ? "challenge-ready" : "observed") : "forwarded";
   const reason = allowlisted
     ? "Source IP matches this website's allowlist."
     : detectionRule === "approved_block" ? "An administrator-approved temporary SentryGate website block matched this observed source IP."
@@ -68,10 +99,17 @@ async function handleRequest(req, res, db, config, requestsByClient) {
       : detectionRule === "rate_limit" ? `Request exceeded ${rule.rateLimitCount} requests in ${rule.windowSeconds} seconds for this observed source IP.`
         : "No enabled gateway rule matched this request.";
 
+  let eventDeliveryFailed=false;
   if (blocked) {
     const status = detectionRule === "rate_limit" ? 429 : 403;
-    await postEvent(db, config, buildEvent(req, parsed.pathname, sourceIp, assetId, status, detectionRule, action, reason, requestTimestamp));
-    return sendText(res, status, detectionRule === "rate_limit" ? "Rate limit exceeded" : "Request blocked by SentryGate");
+    try { await postEvent(db, config, buildEvent(req, parsed.pathname, sourceIp, assetId, status, detectionRule, action, reason, requestTimestamp)); }
+    catch (error) {
+      eventDeliveryFailed=true;
+      logOperational("error","gateway.event_delivery_failed",{assetId,mode:rule.failureMode,code:error.code??error.name??"Error"});
+      if(rule.failureMode === "closed") return sendText(res,503,"Security event service unavailable; request not forwarded");
+      blocked=false; action="forwarded";
+    }
+    if(blocked) return sendText(res, status, detectionRule === "rate_limit" ? "Rate limit exceeded" : "Request blocked by SentryGate");
   }
 
   if (!asset.upstreamUrl) {
@@ -108,7 +146,7 @@ async function handleRequest(req, res, db, config, requestsByClient) {
       const status = upstreamResponse.statusCode ?? 502;
       const event = buildEvent(req, parsed.pathname, sourceIp, assetId, status, detectionRule, action, reason, requestTimestamp);
       (async () => {
-        await postEvent(db, config, event).catch((error) => console.error("Gateway event delivery failed:", error.message));
+        if(!eventDeliveryFailed) await postEvent(db, config, event).catch((error) => logOperational("error","gateway.event_delivery_failed",{assetId,code:error.code??error.name??"Error"}));
         res.writeHead(status, filteredHeaders(upstreamResponse.headers));
         upstreamResponse.pipe(res);
       })().catch((error) => { if (!res.headersSent) sendText(res, 502, "Upstream response failed"); else res.destroy(error); resolve(); });
@@ -121,7 +159,7 @@ async function handleRequest(req, res, db, config, requestsByClient) {
     proxyRequest.setTimeout(config.upstreamTimeoutMs ?? 30000, () => proxyRequest.destroy(new Error("Upstream timeout")));
     proxyRequest.on("error", async () => {
       const reasonText = "The configured upstream could not be reached or timed out.";
-      await postEvent(db, config, buildEvent(req, parsed.pathname, sourceIp, assetId, 502, "upstream_unavailable", "upstream-error", reasonText, requestTimestamp)).catch(() => {});
+      await postEvent(db, config, buildEvent(req, parsed.pathname, sourceIp, assetId, 502, "upstream_unavailable", "upstream-error", reasonText, requestTimestamp)).catch(error => logOperational("error","gateway.event_delivery_failed",{assetId,code:error.code??error.name??"Error"}));
       if (!res.headersSent) sendText(res, 502, "Upstream unavailable");
       resolve();
     });
@@ -172,8 +210,9 @@ function rateExceeded(requestsByClient, assetId, ip, maxRequests, windowSeconds)
 
 function buildEvent(req, pathname, sourceIp, assetId, responseStatus, detectionRule, action, reason, timestamp) {
   const detection = detectionRule !== "none" && detectionRule !== "allowlist";
+  req.sentryEventId=randomUUID();
   return {
-    eventId: randomUUID(),
+    eventId: req.sentryEventId,
     assetId,
     timestamp,
     sourceIp,
@@ -190,12 +229,12 @@ function buildEvent(req, pathname, sourceIp, assetId, responseStatus, detectionR
 }
 
 async function postEvent(db, config, event) {
-  const token = ensureAgentCredential(db, config.sessionSecret);
+  const token = ensureAssetCredential(db, config.sessionSecret, event.assetId);
   const response = await fetch(`${config.apiBaseUrl}/api/agent/events`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+    headers: { "Content-Type": "application/json", "X-SentryGate-Asset-Credential": token },
     body: JSON.stringify(event),
-    signal: AbortSignal.timeout(5000)
+    signal: AbortSignal.timeout(config.eventIngestTimeoutMs ?? 5000)
   });
   if (!response.ok) throw new Error(`Event ingestion failed: ${response.status}`);
 }

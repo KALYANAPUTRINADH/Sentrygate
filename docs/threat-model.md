@@ -1,57 +1,44 @@
 # SentryGate Threat Model
 
-## Scope
+## Scope and Security Objective
 
-SentryGate protects websites and applications owned or administered by the operator, monitors one explicitly installed Windows computer in later milestones, manages approved firewall rules, and presents evidence-based alerts.
+Protect websites and Windows computers administered by the operator, preserve explainable evidence, and keep administrative and firewall actions explicit. The system does not identify people from IP addresses, inspect private application contents, read keystrokes/passwords/browser history, decrypt traffic, terminate processes, or automatically create firewall blocks.
 
-## Assets
+## Components and Trust Boundaries
 
-- Administrator account and session.
-- Local SQLite security database.
-- Website request/event records.
-- Gateway rule configuration and event-ingestion credential.
-- Dashboard data and audit history.
-- Windows device identity and collected process/TCP metadata.
-- Per-device agent credential and encrypted local event outbox.
-- Approved firewall rule specifications, protected management/backend addresses, and apply/rollback history.
+| Component | Sensitive assets | Trust boundary / primary risks |
+| --- | --- | --- |
+| Dashboard/browser | Admin session, incident evidence, one-time credentials | Browser to API; XSS, CSRF, session theft, role bypass, malicious evidence rendering |
+| Backend API | Password verifiers, role checks, ingestion credentials, actions | Authenticated browser/device/gateway requests; authorization mistakes, request exhaustion, unsafe input |
+| Website gateway | Upstream configuration, per-site credentials, observed request metadata | Untrusted internet request to proxy; forged forwarding headers, SSRF, event-sender outage, request flooding |
+| Windows agent | Device credential, local event spool, firewall policy if opted in | Host to API over TLS; credential theft, replay, over-collection, elevated service compromise |
+| Local SQLite | Events, snapshots, incidents, audit rows, encrypted credential material | Local filesystem/service account boundary; theft, tampering, corruption, exhaustion, backup disclosure |
+| Update process | Node dependencies, SentryGate scripts/service executable, database schema | Operator-controlled package/filesystem boundary; malicious or incompatible update, rollback with newer schema |
+| Windows Firewall adapter | Existing Windows rules and SentryGate-owned rules | Local OS privilege boundary; rule ownership confusion, expiry/removal failure, LocalSystem compromise |
 
-## Trust Boundaries
+Assume internet clients can send arbitrary paths, headers, bodies, and timing patterns. Assume an enrolled endpoint can be offline or compromised. The local host administrator and deployment operator are trusted; a stolen owner account or compromised host can alter local code/data.
 
-- Browser to API over HTTP in local development, HTTPS in deployment.
-- Gateway client to configured HTTP(S) upstream.
-- Gateway event sender to authenticated local event-ingestion API.
-- API to local SQLite database.
-- Future reverse proxy to protected upstream applications.
-- Windows agent to API using a unique device bearer credential.
-- Optional elevated Windows agent to the Windows Firewall `NetSecurity` interface.
+## Principal Threats and Current Controls
 
-## Key Threats and Mitigations
+- Credential disclosure: admin passwords use salted scrypt. Device and website tokens have per-asset verifiers; the website gateway's runtime token copy is AES-GCM encrypted using a key derived from the stable session secret. Agent credentials and spool contents use Windows DPAPI. Secrets must not enter source control or logs.
+- Transport interception: API and gateway can use Node HTTPS with TLS 1.2 minimum and normal certificate/hostname validation. Agent and gateway HTTP clients do not disable verification. Cleartext is accepted only for loopback development; remote API/upstream URLs require HTTPS. Deployments need certificates and a trusted root on every client.
+- Session/CSRF: session cookies are HttpOnly and SameSite=Strict; Secure is set whenever listener TLS is enabled. Mutating authenticated requests reject a mismatched scheme/host Origin. Sessions are signed for eight hours, logout revokes that session ID, and role lookup occurs against the database on each request. Failed logins are throttled per immediate peer (10 failures per 15 minutes); throttle state is process-local and resets on restart.
+- Authorization: owner, security_analyst, and read_only_viewer are checked in API routes. Device bearer credentials identify one enrolled device; site credentials are checked against the submitted website asset. Action policy destinations must match the evidence asset. Firewall routes bind rule/device IDs and audit explicit approval.
+- Forged source IP: X-Forwarded-For is ignored unless the immediate TCP peer is explicitly trusted. A source IP is observed network metadata, never verified identity.
+- Gateway failure: website policy selects `open` or `closed` for detected requests when event telemetry cannot be delivered. Open forwards the request; closed returns 503 and does not forward the detected request. Normal upstream traffic is passed through in both modes; event loss is visible in structured logs and bounded by the event timeout. Upstream unavailability returns 502. WebSocket upgrades are unsupported.
+- Input/resource abuse: JSON bodies have a size cap; passwords have a maximum; website policies validate upstream URL and restrict non-loopback HTTP. Database main/WAL/SHM size is bounded; event ingestion returns 507 at the configured limit. Retention runs periodically and compacts after deletions. The agent's DPAPI-protected outbox has byte/event limits and reports degraded health when full. Gateway rate counters remain process-local and are not distributed.
+- Evidence and audit: dashboard HTML escapes request paths, user agents, and evidence. API failures are logged as structured JSON without bodies or credentials. Admin settings, credential lifecycle, and incident actions produce audit entries. Local administrators can still tamper with SQLite; audit log is not cryptographically tamper-evident.
+- Agent/backend outages: endpoint spool uses stable event IDs and retains unacknowledged records; reporting retries after restart. Firewall removal remains pending until an authenticated device reports actual state. Health sweeps create alerts after missed heartbeats. A disconnected agent cannot confirm removal.
+- Database loss: `VACUUM INTO` creates a consistent backup and validates SQLite integrity. Restore validates a staging copy, preserves the prior database, and requires the service to be stopped. Backups need the same filesystem ACL/encryption protections as the live database.
+- Update compromise: upgrades are operator-controlled and must be obtained from a verified source, reviewed, backed up, tested on a noncritical target, and rolled back using the documented procedure. There is no signed auto-update mechanism or compatibility guarantee yet.
 
-- Credential disclosure: passwords are hashed with scrypt and a per-password random salt; plaintext passwords are not written to the database or audit log. The high-entropy gateway token is verified using SHA-256, while its runtime copy is encrypted with AES-GCM using a key derived from the configured secret.
-- Session theft: sessions use signed HttpOnly cookies; production deployment must use HTTPS and secure cookies.
-- Unauthorized administration: all security data endpoints require an authenticated administrator.
-- Evidence confusion: alerts retain concrete evidence fields and avoid identifying a person from an IP address.
-- Forged client IP headers: the gateway uses the socket peer address by default. It reads `X-Forwarded-For` only when that immediate peer is explicitly trusted.
-- Request floods: configurable per-IP rolling-window counters can be observed or blocked; counters are in memory and reset on restart.
-- Sensitive-path probing: configurable `/.env` and `/.git/` detection records an explainable event and can block in Block mode.
-- Proxy destination changes: only authenticated administrators can set a website upstream or its protection rules, and each change is audited.
-- Local data loss: SQLite is local; operators should back up the configured data path.
-- Device credential compromise: every enrolled device has a unique random credential; only its SHA-256 verifier is stored by the API. Credential rotation invalidates the old value and revocation prevents future reports. Agent credential plaintext is shown once and protected with Windows DPAPI on the endpoint.
-- Local agent data disclosure: event payloads in the outbox are DPAPI-protected. Service data is ACL-restricted to SYSTEM and Administrators. Development-mode files inherit the current user's profile permissions.
-- Telemetry overcollection: the collector reads only process identity metadata (PID, parent PID, image name, start time) and TCP connection metadata (PID, state, endpoints, timestamp). It does not collect process command lines, file/application contents, keystrokes, passwords, browser history, or decrypt encrypted traffic.
-- Agent report replay: event IDs are unique per device and persisted by the API, so buffered retries are acknowledged without duplicate event or alert rows.
-- Observe-only detection: new listener, configured high outbound-count threshold, and repeated report failures produce evidence-backed events. The agent has no process termination or traffic-blocking capability.
-- Unauthorized firewall changes: proposals are inert; apply and rollback require an authenticated administrator confirmation. A preview token binds approval to the proposal. Automatic rule creation is disabled.
-- Overbroad firewall rules: only inbound IP/CIDR + TCP/UDP + one port Block rules are accepted, with a mandatory expiry. Loopback, resolved API backend addresses, and configured administrator management addresses are protected. New management addresses cannot conflict with pending or active rules.
-- Unrelated firewall rule deletion: the agent addresses only rules carrying the exact generated `SentryGate-<id>` name, `SentryGate` group, and managed description. It never disables the Windows Firewall. Filter drift is reported as failure, not silently overwritten. Uninstall cleanup uses the same ownership checks.
-- Delayed rollback/expiry: dashboard state remains pending until the enrolled agent reconnects and reports Windows state. Approved policy is DPAPI-protected locally so expiry can be enforced during backend outages; the agent must be running.
-- Privilege expansion: foreground agent mode needs no elevation. The default Windows service runs as LocalService. Firewall application requires the explicit `-EnableFirewallManagement` installer option and a second typed confirmation, which runs the entire agent service as LocalSystem. This is a significant privilege increase and expands impact if the agent or its dependencies are compromised; use only on a device the operator administers.
+## Residual Risks / Pilot Limits
 
-## Non-Goals
-
-- SentryGate does not intercept private app contents.
-- SentryGate does not decrypt encrypted traffic.
-- SentryGate does not claim an IP address identifies a person.
-- Milestone 2 does not proxy WebSocket upgrades.
-- The agent currently reports TCP connection metadata only; UDP inventory and process termination are not implemented.
-- The gateway is a local single-process evaluation service, not a production edge deployment.
+- This is a controlled-pilot candidate, not evidence of production readiness. No third-party penetration test, formal cryptographic audit, Windows fleet test, or long-duration availability test has been completed.
+- The gateway and API are single-process Node services. Gateway rate limits are memory-local, and SQLite is a single local database. Neither is horizontally scalable.
+- Gateway instance state currently represents the local gateway process serving configured website assets; it is not an independently provisioned worker per website.
+- Website enforcement and telemetry share the same local API/database dependency. Fail-closed mode intentionally trades availability for enforcement on detected requests.
+- No mutual TLS is implemented; high-entropy per-asset bearer credentials are protected in transit by server-authenticated TLS.
+- SQLite and audit history are not encrypted or tamper-evident by SentryGate. Use BitLocker/encrypted storage, restrictive service ACLs, and protected off-host backups.
+- Windows service firewall mode runs the whole agent as LocalSystem. Keep disabled for the initial pilot unless specifically approved; the pilot plan does not require a firewall change.
+- Dashboard responsiveness and load results are synthetic loopback measurements on the test host, not a capacity guarantee.

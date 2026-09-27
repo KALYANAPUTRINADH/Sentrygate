@@ -17,11 +17,18 @@
     "demo:firewall": "node apps/api/scripts/demo-firewall.js",
     "demo:incidents": "node apps/api/scripts/demo-incidents.js",
     "demo:actions": "node apps/api/scripts/demo-actions.js",
+    "db:backup": "node apps/api/scripts/backup-db.js",
+    "db:restore": "node apps/api/scripts/restore-db.js",
+    "load:test": "node apps/api/scripts/load-test.js",
+    "pilot:check": "node apps/api/scripts/pilot-check.js",
+    "pilot:simulate": "node apps/api/scripts/pilot-simulate.js",
+    "pilot:rollback": "node apps/api/scripts/pilot-rollback.js",
+    "pilot:report": "node apps/api/scripts/pilot-report.js",
     "sample:site": "node apps/api/scripts/sample-site.js",
     "agent:dev": "node apps/agent/src/agent.js",
     "test": "node --test \"apps/api/test/*.test.js\" \"apps/agent/test/*.test.js\" \"apps/web/test/*.test.js\"",
     "build": "node apps/api/scripts/verify-static-assets.js",
-    "typecheck": "node --check apps/api/src/server.js && node --check apps/api/src/app.js && node --check apps/api/src/actions.js && node --check apps/api/src/firewall.js && node --check apps/api/src/incidents.js && node --check apps/api/src/gateway.js && node --check apps/api/src/agent-credentials.js && node --check apps/api/scripts/sample-site.js && node --check apps/api/scripts/smoke-gateway.js && node --check apps/api/scripts/demo-agent.js && node --check apps/api/scripts/demo-firewall.js && node --check apps/api/scripts/demo-incidents.js && node --check apps/api/scripts/demo-actions.js && node --check apps/web/assets/app.js && node --check apps/web/assets/escape.js && node --check apps/web/assets/incident-render.js && node --check apps/agent/src/agent.js && node --check apps/agent/src/windows-firewall.js && node --check apps/agent/src/detection.js && node --check apps/agent/src/spool.js && node --check apps/agent/src/windows-collector.js"
+    "typecheck": "node --check apps/api/src/server.js && node --check apps/api/src/app.js && node --check apps/api/src/actions.js && node --check apps/api/src/firewall.js && node --check apps/api/src/incidents.js && node --check apps/api/src/gateway.js && node --check apps/api/src/agent-credentials.js && node --check apps/api/src/config.js && node --check apps/api/src/operations.js && node --check apps/api/src/storage.js && node --check apps/api/src/pilot.js && node --check apps/api/scripts/backup-db.js && node --check apps/api/scripts/restore-db.js && node --check apps/api/scripts/load-test.js && node --check apps/api/scripts/pilot-check.js && node --check apps/api/scripts/pilot-simulate.js && node --check apps/api/scripts/pilot-rollback.js && node --check apps/api/scripts/pilot-report.js && node --check apps/api/scripts/sample-site.js && node --check apps/api/scripts/smoke-gateway.js && node --check apps/api/scripts/demo-agent.js && node --check apps/api/scripts/demo-firewall.js && node --check apps/api/scripts/demo-incidents.js && node --check apps/api/scripts/demo-actions.js && node --check apps/web/assets/app.js && node --check apps/web/assets/escape.js && node --check apps/web/assets/incident-render.js && node --check apps/agent/src/agent.js && node --check apps/agent/src/windows-firewall.js && node --check apps/agent/src/detection.js && node --check apps/agent/src/spool.js && node --check apps/agent/src/windows-collector.js"
   },
   "engines": {
     "node": ">=24"

@@ -41,6 +41,8 @@ internal static class ServiceHost
         {
             var start = new ProcessStartInfo { FileName = launchArgs[0], Arguments = "\"" + launchArgs[1] + "\"", WorkingDirectory = System.IO.Path.GetDirectoryName(launchArgs[1]), UseShellExecute = false, CreateNoWindow = true };
             start.EnvironmentVariables["SENTRYGATE_AGENT_CONFIG"] = launchArgs[2];
+            if (launchArgs.Length > 3 && !String.IsNullOrWhiteSpace(launchArgs[3]))
+                start.EnvironmentVariables["NODE_EXTRA_CA_CERTS"] = launchArgs[3];
             child = Process.Start(start);
             SetState(SERVICE_RUNNING, SERVICE_ACCEPT_STOP, 0);
             child.WaitForExit();

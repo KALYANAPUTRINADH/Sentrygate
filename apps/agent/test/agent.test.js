@@ -47,6 +47,18 @@ test("encrypted event spool retries pending entries, acknowledges IDs, and suppr
   spool.close();
 });
 
+test("agent event spool enforces a bounded queue without losing idempotent retries",()=>{
+  const spool=new EventSpool(":memory:",{maxEvents:1,maxBytes:1024*1024});
+  const first={eventId:"capacity-1",timestamp:new Date().toISOString()},second={eventId:"capacity-2",timestamp:new Date().toISOString()};
+  assert.equal(spool.enqueue(first),true);
+  assert.equal(spool.enqueue(first),true);
+  assert.equal(spool.enqueue(second),false);
+  assert.equal(spool.count(),1);
+  spool.acknowledge([first.eventId]);
+  assert.equal(spool.enqueue(second),true);
+  spool.close();
+});
+
 test("Windows collector normalizes mocked process and TCP APIs without collecting private content", async () => {
   const result = await collectWindowsMetadata({ run: async () => ({
     processes: { Pid: 5, ParentPid: 1, Name: "worker.exe", StartedAt: "2026-09-01T00:00:00Z" },
@@ -60,7 +72,7 @@ test("Windows collector normalizes mocked process and TCP APIs without collectin
 test("agent buffers while backend is unavailable and resends until acknowledged", async () => {
   const spool = new EventSpool(path.join(os.tmpdir(), `sentrygate-agent-${randomUUID()}.db`));
   const detector = createDetector();
-  const config = { deviceId: randomUUID(), apiBaseUrl: "http://offline.test", collectProcesses: true, collectConnections: true };
+  const config = { deviceId: randomUUID(), apiBaseUrl: "https://offline.test", collectProcesses: true, collectConnections: true };
   const collect = async () => ({ processes: [], connections: [] });
   const down = await sampleAndReport({ config, credential: "not-logged", spool, detector, collect, lookupImpl: async () => [], fetchImpl: async () => { throw new Error("offline"); } });
   assert.equal(down.delivered, false);
@@ -78,10 +90,19 @@ test("agent buffers while backend is unavailable and resends until acknowledged"
   spool.close();
 });
 
+test("agent refuses remote cleartext APIs and preserves normal TLS certificate failures",async()=>{
+  const spool=new EventSpool(":memory:"),base={deviceId:randomUUID(),apiBaseUrl:"http://api.example.invalid",retainedDays:30};
+  await assert.rejects(()=>sampleAndReport({config:base,credential:"credential",spool,detector:createDetector(),collect:async()=>({processes:[],connections:[]})}),/require HTTPS/);
+  const config={...base,apiBaseUrl:"https://api.example.invalid"};
+  const result=await sampleAndReport({config,credential:"credential",spool,detector:createDetector(),collect:async()=>({processes:[],connections:[]}),lookupImpl:async()=>[],fetchImpl:async()=>{throw new TypeError("self-signed certificate");}});
+  assert.equal(result.delivered,false);
+  spool.close();
+});
+
 test("agent passes approved policies to the mocked firewall adapter and reports exact observed state", async () => {
   const spool = new EventSpool(":memory:");
   const deviceId = randomUUID(), rule = { id: randomUUID(), name: "SentryGate-test", group: "SentryGate", status: "approved", operation: "ensure", remoteAddress: "198.51.100.8/32", protocol: "TCP", localPort: 65000, expiresAt: new Date(Date.now() + 300000).toISOString() };
-  const seen = [], config = { deviceId, apiBaseUrl: "http://sentrygate.test", retainedDays: 30 };
+  const seen = [], config = { deviceId, apiBaseUrl: "https://sentrygate.test", retainedDays: 30 };
   const result = await sampleAndReport({ config, credential: "secret-token", spool, detector: createDetector(), collect: async () => ({ processes: [], connections: [] }), lookupImpl: async () => [{ address: "203.0.113.40" }], policyStore: { save: (rules) => seen.push(["cache", rules]), load: () => [] }, firewall: async (rules) => { seen.push(["apply", rules]); return { results: [{ id: rule.id, status: "active", detail: "Mock firewall confirms owned rule", actualState: { name: rule.name, group: "SentryGate", action: "Block" } }] }; }, fetchImpl: async (url, options = {}) => {
     if (url.endsWith("/config")) return Response.json({ firewallRules: [rule], collectProcesses: false, collectConnections: false });
     if (url.endsWith("/report")) { seen.push(["device-report", JSON.parse(options.body)]); return Response.json({ acceptedEventIds: [], settings: {} }); }
