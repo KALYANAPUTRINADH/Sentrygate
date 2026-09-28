@@ -471,3 +471,20 @@ Get-FileHash .\release\SentryGate-0.1.0-Windows-x64.zip -Algorithm SHA256
 ```
 
 The generated release contains `INSTALL-WINDOWS.md`, a private Node runtime, the local backend/dashboard/SQLite code, the agent, and lifecycle scripts. No `.env` files or existing database/event data are bundled. For GitHub distribution, tag `v0.1.0`; `.github/workflows/windows-release.yml` tests/packages it and waits for the protected `windows-clean-vm-qualified` environment. Set the environment variable `SENTRYGATE_CLEAN_WINDOWS_VM_VERIFIED=true` and approve only after the exact candidate passes the clean-VM checklist. The attached assets are `SentryGate-0.1.0-Windows-x64.zip` and `SentryGate-0.1.0-Windows-x64.zip.sha256` (plus `RELEASE-CHECKLIST.md`). The root `Install-SentryGate.ps1 -Version v0.1.0` downloads that named release, verifies its checksum, installs, and checks `SentryGateAgent`; for an existing installation use `-Update` to preserve local data. Each fresh computer creates its own database, administrator, device identity, and credential. The default required service is `SentryGateAgent`; `SentryGateFirewallHelper` is optional and remains uninstalled unless separately requested. Observe and preview-only defaults remain in force. See [INSTALL-WINDOWS.md](INSTALL-WINDOWS.md) for exact release, install, health, update, rollback, uninstall, and clean-VM qualification commands.
+# Investigated Alert Response
+
+Open an alert from the Alerts page to review its linked event evidence and choose a response:
+
+- **Dismiss as false positive** records the reviewer and reason, marks the linked event, and preserves its evidence.
+- **Allow this IP on this website** is available to the owner only for an exact IP observed by that website gateway. It changes only that website's allowlist and is audited.
+- **Propose a temporary source or application block** is preview-only. For an enrolled Windows device, enter a protocol/port and expiry or an executable path observed in its latest process inventory. The firewall page shows the exact scope and expiry. The administrator must separately approve it; global firewall enforcement remains disabled unless explicitly enabled for application policies.
+
+Only the signed SentryGate Windows helper applies Windows Firewall rules. It accepts SentryGate ownership labels only, verifies the resulting rule, and reports failures. Expired or rolled-back rules are queued for removal; the helper removes and checks the owned rule, then reports the result. If the device is offline, removal waits for reconnection and is shown as pending. macOS does not support SentryGate firewall writes; other supported-platform adapters retain their documented limits.
+
+Immediate rollback is available from the Firewall page. To request rollback from PowerShell, run from the repository root and enter the local administrator credentials in the secure credential prompt:
+
+```powershell
+.\scripts\Rollback-FirewallRule.ps1 -RuleId '<SentryGate-rule-guid>'
+```
+
+The command queues removal through the authenticated local API; it does not directly edit the firewall. Verify `removed` and the reported actual state in the dashboard's Firewall page after the enrolled agent reports back. The rule GUID is shown with the rule in dashboard details/history. Automatic blocking is not enabled by installation or by an alert.

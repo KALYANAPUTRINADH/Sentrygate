@@ -330,7 +330,7 @@ async function route(req, res, db, config, loginAttempts) {
     if(origin){try{if(!sameRequestOrigin(origin,req))return json(res,403,{error:"Cross-origin administrator request rejected"});}catch{return json(res,403,{error:"Invalid request origin"});}}
   }
   if (url.pathname.startsWith("/api/") && admin.role !== "owner") {
-    const analystWrite = admin.role === "security_analyst" && ((req.method === "POST" && /^\/api\/incidents\/[a-f0-9-]+\/notes$/.test(url.pathname)) || (req.method === "PATCH" && /^\/api\/incidents\/[a-f0-9-]+\/status$/.test(url.pathname)) || (req.method === "POST" && url.pathname === "/api/action-policies") || (req.method === "POST" && /^\/api\/events\/\d+\/false-positive$/.test(url.pathname)) || (req.method === "POST" && /^\/api\/analysis\/findings\/[a-f0-9-]+\/feedback$/i.test(url.pathname)));
+    const analystWrite = admin.role === "security_analyst" && ((req.method === "POST" && /^\/api\/incidents\/[a-f0-9-]+\/notes$/.test(url.pathname)) || (req.method === "PATCH" && /^\/api\/incidents\/[a-f0-9-]+\/status$/.test(url.pathname)) || (req.method === "POST" && url.pathname === "/api/action-policies") || (req.method === "POST" && ["/api/firewall/rules", "/api/application-policies/preview"].includes(url.pathname)) || (req.method === "POST" && /^\/api\/events\/\d+\/false-positive$/.test(url.pathname)) || (req.method === "POST" && /^\/api\/alerts\/\d+\/respond$/.test(url.pathname)) || (req.method === "POST" && /^\/api\/analysis\/findings\/[a-f0-9-]+\/feedback$/i.test(url.pathname)));
     if (!(["GET", "HEAD"].includes(req.method)) && !analystWrite) return json(res, 403, { error: "This administrator role cannot perform that action" });
   }
 
@@ -365,8 +365,9 @@ async function route(req, res, db, config, loginAttempts) {
       if (existing.device_id !== body.deviceId || existing.program_path.toLowerCase() !== body.programPath.toLowerCase() || existing.mode !== body.mode || existing.expires_at !== body.expiresAt || existing.reason !== body.reason.trim() || existing.evidence !== body.evidence.trim()) return json(res, 409, { error: "Idempotency key was already used for a different application policy" });
       return json(res, 200, { policy: applicationPolicyForDashboard(existing), preview: JSON.parse(existing.preview_json) });
     }
-    const device = db.prepare("SELECT device_id,is_demo FROM device_agents WHERE device_id=? AND revoked_at IS NULL").get(body.deviceId);
+    const device = db.prepare("SELECT device_id,is_demo,os_version FROM device_agents WHERE device_id=? AND revoked_at IS NULL").get(body.deviceId);
     if (!device || device.is_demo) return json(res, 404, { error: "A non-demo enrolled device is required" });
+    if (!/windows/i.test(device.os_version)) return json(res, 400, { error: "Per-application firewall rules are currently supported only for enrolled Windows devices" });
     const snapshot = db.prepare("SELECT processes_json FROM device_snapshots WHERE device_id=?").get(body.deviceId);
     const observed = snapshot ? JSON.parse(snapshot.processes_json).find((process) => typeof process.executablePath === "string" && process.executablePath.toLowerCase() === body.programPath.toLowerCase()) : null;
     if (!observed) return json(res, 400, { error: "Select an executable path observed in this device's latest process inventory" });
@@ -849,7 +850,7 @@ async function route(req, res, db, config, loginAttempts) {
     const cutoff = new Date(Date.now() - 86_400_000).toISOString();
     return json(res, 200, {
       assets: db.prepare("SELECT COUNT(*) AS count FROM assets").get().count,
-      openAlerts: db.prepare("SELECT COUNT(*) AS count FROM alerts WHERE status != 'closed'").get().count,
+      openAlerts: db.prepare("SELECT COUNT(*) AS count FROM alerts WHERE status NOT IN ('closed','false_positive')").get().count,
       openIncidents: db.prepare("SELECT COUNT(*) AS count FROM incidents WHERE status != 'resolved'").get().count,
       events24h: db.prepare("SELECT COUNT(*) AS count FROM events WHERE created_at >= ?").get(cutoff).count,
       audit24h: db.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE created_at >= ?").get(cutoff).count
@@ -1036,9 +1037,42 @@ async function route(req, res, db, config, loginAttempts) {
   if (alertMatch && req.method === "GET") {
     const alert = db.prepare(`SELECT alerts.id, alerts.asset_id AS assetId, assets.name AS assetName, alerts.title,
         alerts.severity, alerts.status, alerts.evidence, alerts.observed_facts AS observedFacts, alerts.estimate,
-        device_agents.name AS deviceName, alerts.created_at AS createdAt
-        FROM alerts LEFT JOIN assets ON assets.id = alerts.asset_id LEFT JOIN device_agents ON device_agents.device_id=alerts.device_id WHERE alerts.id = ?`).get(Number(alertMatch[1]));
+        device_agents.name AS deviceName, device_agents.device_id AS deviceId, device_agents.os_version AS deviceOsVersion, assets.type AS assetType,
+        events.id AS eventId, events.source AS eventSource, events.observed_source_ip AS observedSourceIp,
+        events.method, events.request_path AS requestPath, events.user_agent AS userAgent,
+        events.request_details AS requestDetails, events.process_details AS processDetails,
+        events.detection_rule AS detectionRule, events.action AS eventAction, events.response_status AS responseStatus,
+        alerts.created_at AS createdAt
+        FROM alerts LEFT JOIN assets ON assets.id = alerts.asset_id LEFT JOIN device_agents ON device_agents.device_id=alerts.device_id
+        LEFT JOIN events ON events.id=alerts.event_id WHERE alerts.id = ?`).get(Number(alertMatch[1]));
     return alert ? json(res, 200, alert) : json(res, 404, { error: "Alert not found" });
+  }
+
+  const alertResponse = url.pathname.match(/^\/api\/alerts\/(\d+)\/respond$/);
+  if (alertResponse && req.method === "POST") {
+    const id = Number(alertResponse[1]), body = await readJson(req);
+    const alert = db.prepare(`SELECT al.*,ev.source AS event_source,ev.observed_source_ip,ev.id AS linked_event_id,
+      a.type AS asset_type,a.name AS asset_name FROM alerts al
+      LEFT JOIN events ev ON ev.id=al.event_id LEFT JOIN assets a ON a.id=al.asset_id WHERE al.id=?`).get(id);
+    if (!alert) return json(res, 404, { error: "Alert not found" });
+    if (typeof body.reason !== "string" || !body.reason.trim() || body.reason.trim().length > 500) return json(res, 400, { error: "A response reason is required (maximum 500 characters)" });
+    const now = new Date().toISOString();
+    if (body.action === "dismiss") {
+      if (!alert.linked_event_id) return json(res, 409, { error: "This alert has no retained source event to classify" });
+      db.prepare("UPDATE alerts SET status='false_positive' WHERE id=?").run(id);
+      db.prepare("UPDATE events SET false_positive=1,reviewed_by=?,reviewed_at=? WHERE id=?").run(admin.email, now, alert.linked_event_id);
+      recordAudit(db, admin.email, "alert.dismissed_false_positive", `alert:${id}`, `Dismissed alert as a false positive. Reason: ${body.reason.trim()}. Source event ${alert.linked_event_id} and original evidence were preserved.`);
+      return json(res, 200, { id, status: "false_positive", eventId: alert.linked_event_id, reviewedBy: admin.email, reviewedAt: now });
+    }
+    if (body.action === "allowlist") {
+      if (admin.role !== "owner") return json(res, 403, { error: "Only an owner can change an asset allowlist" });
+      const ip = alert.observed_source_ip;
+      if (alert.event_source !== "website-gateway" || alert.asset_type !== "website" || !ip || !net.isIP(ip)) return json(res, 409, { error: "Only an exact source IP observed by a website gateway can be allowlisted from this alert" });
+      db.prepare("INSERT OR IGNORE INTO gateway_allowlist(asset_id,ip,created_at) VALUES(?,?,?)").run(alert.asset_id, ip, now);
+      recordAudit(db, admin.email, "alert.source_ip_allowlisted", `alert:${id}`, `Added exact observed IP ${ip} to website asset ${alert.asset_id} allowlist. Reason: ${body.reason.trim()}. This is scoped to this website only.`);
+      return json(res, 200, { id, assetId: alert.asset_id, ip, scope: "single website asset" });
+    }
+    return json(res, 400, { error: "Action must be dismiss or allowlist; blocks must be created from a reviewed firewall preview" });
   }
 
   if (url.pathname === "/api/alerts" && req.method === "GET") {

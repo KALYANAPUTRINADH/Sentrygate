@@ -67,6 +67,10 @@ function render() {
   document.querySelector("#logout").addEventListener("click", async () => { await api("/api/logout", { method: "POST" }); state.session = null; await refresh(); });
   document.querySelector("#asset-form")?.addEventListener("submit", createAsset);
   document.querySelectorAll("[data-alert]").forEach((button) => button.addEventListener("click", () => openAlert(button.dataset.alert)));
+  document.querySelector("#alert-dismiss")?.addEventListener("click", dismissCurrentAlert);
+  document.querySelector("#alert-allowlist")?.addEventListener("click", allowlistCurrentAlert);
+  document.querySelector("#alert-block-preview")?.addEventListener("submit", previewAlertBlock);
+  document.querySelector("#alert-app-preview")?.addEventListener("submit", previewAlertApplicationBlock);
   document.querySelectorAll("[data-device]").forEach((button) => button.addEventListener("click", () => openDevice(button.dataset.device)));
   document.querySelectorAll("[data-asset]").forEach((button) => button.addEventListener("click", () => openAsset(button.dataset.asset)));
   document.querySelector("#back-assets")?.addEventListener("click", () => { state.assetDetail = null; render(); });
@@ -320,7 +324,12 @@ function settingsPage(auditLog, gatewaySettings, incidentSettings, storage) {
 }
 
 function alertDetail(alert) {
-  return `<button id="back-alerts" class="text-button">← Back to alerts</button><article class="detail-view"><div class="detail-top"><span class="severity ${escapeHtml(alert.severity)}">${escapeHtml(alert.severity)}</span><span class="subtle">${escapeHtml(alert.status)}</span></div><h2>${escapeHtml(alert.title)}</h2><p class="subtle">${escapeHtml(alert.deviceName ?? alert.assetName ?? "Unassigned asset")} · ${new Date(alert.createdAt).toLocaleString()}</p><div class="evidence-box"><p class="eyebrow">EVIDENCE</p><p>${escapeHtml(alert.evidence)}</p></div><dl class="facts"><dt>Observed facts</dt><dd>${escapeHtml(alert.observedFacts)}</dd><dt>Assessment</dt><dd>${escapeHtml(alert.estimate ?? "No estimate recorded")}</dd></dl></article>`;
+  const hasObservedIp = Boolean(alert.observedSourceIp && alert.deviceId && /windows/i.test(alert.deviceOsVersion ?? ""));
+  const websiteAlert = alert.eventSource === "website-gateway" && alert.assetType === "website" && alert.observedSourceIp;
+  const unresolved = alert.status !== "false_positive" && alert.status !== "closed";
+  const expiry = new Date(Date.now() + 60 * 60_000).toISOString().slice(0, 16);
+  const response = `<section class="section-block"><div class="section-heading"><div><p class="eyebrow">REVIEWED RESPONSE</p><h2>Choose an action</h2></div></div><p class="subtle">Actions are scoped to the evidence shown. A block is only proposed here; the firewall page shows the exact rule and expiry and requires a separate administrator approval.</p>${unresolved ? `<div class="report-actions"><button id="alert-dismiss" class="quiet-button">Dismiss as false positive</button>${websiteAlert && state.session.admin.role === "owner" ? `<button id="alert-allowlist" class="quiet-button">Allow this IP on this website</button>` : ""}</div>` : `<p class="notice">This alert has been reviewed as ${escapeHtml(alert.status)}.</p>`}${hasObservedIp && unresolved ? `<form id="alert-block-preview" class="firewall-form"><h3>Propose temporary source block</h3><p class="subtle">Observed IP: <code>${escapeHtml(alert.observedSourceIp)}</code> · device: ${escapeHtml(alert.deviceName)}. This does not apply a rule.</p><label>Protocol<select name="protocol"><option>TCP</option><option>UDP</option></select></label><label>Local port<input name="localPort" type="number" min="1" max="65535" value="443" required></label><label>Expiry<input name="expiresAt" type="datetime-local" value="${expiry}" required></label><label class="wide">Reason<input name="reason" maxlength="500" required value="Response to alert ${alert.id}"></label><p class="form-error" id="alert-response-error"></p><button class="primary-button">Review exact firewall rule</button></form>` : ""}${alert.deviceId && /windows/i.test(alert.deviceOsVersion ?? "") && unresolved ? `<form id="alert-app-preview" class="firewall-form"><h3>Propose application block</h3><p class="subtle">Windows only. Enter the exact executable path observed in this device’s latest process inventory; the agent applies only a separately approved SentryGate-owned inbound rule.</p><label class="wide">Executable path<input name="programPath" maxlength="2048" required placeholder="C:\\Program Files\\Example\\app.exe"></label><label class="wide">Reason<input name="reason" maxlength="500" required value="Response to alert ${alert.id}"></label><label>Expiry<input name="expiresAt" type="datetime-local" value="${expiry}" required></label><p class="form-error" id="alert-app-error"></p><button class="primary-button">Review application rule</button></form>` : ""}</section>`;
+  return `<button id="back-alerts" class="text-button">← Back to alerts</button><article class="detail-view"><div class="detail-top"><span class="severity ${escapeHtml(alert.severity)}">${escapeHtml(alert.severity)}</span><span class="subtle">${escapeHtml(alert.status)}</span></div><h2>${escapeHtml(alert.title)}</h2><p class="subtle">${escapeHtml(alert.deviceName ?? alert.assetName ?? "Unassigned asset")} · ${new Date(alert.createdAt).toLocaleString()}</p><div class="evidence-box"><p class="eyebrow">EVIDENCE</p><p>${escapeHtml(alert.evidence)}</p></div><dl class="facts"><dt>Observed facts</dt><dd>${escapeHtml(alert.observedFacts)}</dd><dt>Assessment</dt><dd>${escapeHtml(alert.estimate ?? "No estimate recorded")}</dd>${alert.observedSourceIp ? `<dt>Observed source IP</dt><dd class="mono">${escapeHtml(alert.observedSourceIp)}</dd>` : ""}${alert.detectionRule ? `<dt>Detection rule / response</dt><dd>${escapeHtml(alert.detectionRule)} · ${escapeHtml(alert.eventAction ?? "recorded")}</dd>` : ""}${alert.requestDetails || alert.requestPath ? `<dt>Request</dt><dd>${escapeHtml(alert.method ?? "")} ${escapeHtml(alert.requestPath || alert.requestDetails)}</dd>` : ""}${alert.processDetails ? `<dt>Process evidence</dt><dd>${escapeHtml(alert.processDetails)}</dd>` : ""}${alert.responseStatus ? `<dt>Response status</dt><dd>${alert.responseStatus}</dd>` : ""}</dl></article>${response}`;
 }
 
 function metric(label, value, tone, icon) { return `<article class="metric"><span class="metric-icon ${tone}">${icon}</span><span class="metric-label">${label}</span><strong>${value}</strong></article>`; }
@@ -490,6 +499,46 @@ async function rotateCredential() {
 async function openAlert(id) {
   try { state.alert = await api(`/api/alerts/${id}`); render(); document.querySelector("#back-alerts").addEventListener("click", () => { state.alert = null; render(); }); }
   catch (error) { state.error = error.message; }
+}
+
+async function dismissCurrentAlert() {
+  if (!state.alert || !confirm("Classify this alert and its linked event as a false positive? Original evidence will be retained and the action audited.")) return;
+  const reason = prompt("Reason for false-positive classification:");
+  if (!reason?.trim()) return;
+  try { await api(`/api/alerts/${state.alert.id}/respond`, { method: "POST", body: JSON.stringify({ action: "dismiss", reason }) }); await refresh(); await openAlert(state.alert.id); }
+  catch (error) { state.error = error.message; render(); }
+}
+
+async function allowlistCurrentAlert() {
+  if (!state.alert || !confirm(`Allow only observed IP ${state.alert.observedSourceIp} on website ${state.alert.assetName}? This changes no other asset.`)) return;
+  const reason = prompt("Reason for the narrowly scoped allow rule:");
+  if (!reason?.trim()) return;
+  try { await api(`/api/alerts/${state.alert.id}/respond`, { method: "POST", body: JSON.stringify({ action: "allowlist", reason }) }); await refresh(); await openAlert(state.alert.id); }
+  catch (error) { state.error = error.message; render(); }
+}
+
+async function previewAlertBlock(event) {
+  event.preventDefault();
+  const alert = state.alert, values = Object.fromEntries(new FormData(event.currentTarget));
+  const remoteCidr = alert.observedSourceIp.includes(":") ? `${alert.observedSourceIp}/128` : `${alert.observedSourceIp}/32`;
+  const device = state.data.devices.find((item) => item.deviceId === alert.deviceId);
+  try {
+    const result = await api("/api/firewall/rules", { method: "POST", body: JSON.stringify({ deviceId: alert.deviceId, remoteCidr, protocol: values.protocol, localPort: Number(values.localPort), expiresAt: new Date(values.expiresAt).toISOString(), reason: values.reason, evidence: `Alert ${alert.id}: ${alert.evidence}`, idempotencyKey: crypto.randomUUID() }) });
+    state.firewallPreview = { ...result.rule, previewToken: result.previewToken, deviceName: device?.name ?? alert.deviceName };
+    state.alert = null; state.page = "firewall"; await refresh(); render();
+  } catch (error) { document.querySelector("#alert-response-error").textContent = error.message; }
+}
+
+async function previewAlertApplicationBlock(event) {
+  event.preventDefault();
+  const alert = state.alert, values = Object.fromEntries(new FormData(event.currentTarget));
+  const programPath = values.programPath.trim();
+  const applicationName = programPath.split(/[\\/]/).at(-1) || "Observed application";
+  try {
+    const result = await api("/api/application-policies/preview", { method: "POST", body: JSON.stringify({ deviceId: alert.deviceId, applicationName, programPath, mode: "block", reason: values.reason, evidence: `Alert ${alert.id}: ${alert.evidence}`, expiresAt: new Date(values.expiresAt).toISOString(), idempotencyKey: crypto.randomUUID() }) });
+    state.applicationPolicyPreview = { ...result.preview, id: result.policy.id };
+    state.alert = null; state.page = "devices"; await openDevice(alert.deviceId);
+  } catch (error) { document.querySelector("#alert-app-error").textContent = error.message; }
 }
 
 async function filterEvents(event) {

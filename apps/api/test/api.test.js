@@ -165,6 +165,43 @@ test("alert detail endpoint returns evidence for investigation", async () => {
   assert.equal(alert.body.observedFacts, "Two requests in logs");
 });
 
+test("alert response preserves evidence when dismissed and allowlists only the exact observed website IP", async () => {
+  const session = await setupAdmin(), headers = { Cookie: session.cookie };
+  const assetId = Number(db.prepare("INSERT INTO assets(name,type,owner,status,address,description,created_at) VALUES(?,?,?,?,?,?,?)")
+    .run("Response website", "website", "admin@example.com", "healthy", "https://response.example.test", "", new Date().toISOString()).lastInsertRowid);
+  const eventId = Number(db.prepare(`INSERT INTO events(asset_id,source,category,action,reason,evidence,observed_source_ip,request_details,severity,detection_rule,created_at)
+    VALUES(?,'website-gateway','request','blocked','Sensitive path rule','Observed GET /.env',?,'GET /.env','high','sensitive_path',?)`)
+    .run(assetId, "198.51.100.44", new Date().toISOString()).lastInsertRowid);
+  const alertId = Number(db.prepare(`INSERT INTO alerts(asset_id,event_id,title,severity,status,evidence,observed_facts,created_at)
+    VALUES(?,?,'Sensitive path request','high','open','Observed GET /.env','Gateway observed a sensitive-path request',?)`)
+    .run(assetId, eventId, new Date().toISOString()).lastInsertRowid);
+  const detail = await jsonFetch(`/api/alerts/${alertId}`, { headers });
+  assert.equal(detail.body.observedSourceIp, "198.51.100.44");
+  assert.equal(detail.body.eventSource, "website-gateway");
+  const invalid = await jsonFetch(`/api/alerts/${alertId}/respond`, { method: "POST", headers, body: JSON.stringify({ action: "allowlist", reason: "" }) });
+  assert.equal(invalid.response.status, 400);
+  const allowed = await jsonFetch(`/api/alerts/${alertId}/respond`, { method: "POST", headers, body: JSON.stringify({ action: "allowlist", reason: "Verified partner monitor" }) });
+  assert.equal(allowed.response.status, 200);
+  assert.deepEqual(db.prepare("SELECT asset_id,ip FROM gateway_allowlist WHERE asset_id=?").all(assetId).map((row) => ({ asset_id: row.asset_id, ip: row.ip })), [{ asset_id: assetId, ip: "198.51.100.44" }]);
+  assert.match(db.prepare("SELECT detail FROM audit_log WHERE action='alert.source_ip_allowlisted'").get().detail, /Verified partner monitor/);
+  const dismissed = await jsonFetch(`/api/alerts/${alertId}/respond`, { method: "POST", headers, body: JSON.stringify({ action: "dismiss", reason: "Confirmed internal scanner" }) });
+  assert.equal(dismissed.body.status, "false_positive");
+  assert.equal(db.prepare("SELECT false_positive FROM events WHERE id=?").get(eventId).false_positive, 1);
+  assert.equal(db.prepare("SELECT status FROM alerts WHERE id=?").get(alertId).status, "false_positive");
+  assert.ok(db.prepare("SELECT 1 FROM audit_log WHERE action='alert.dismissed_false_positive' AND detail LIKE '%Confirmed internal scanner%'").get());
+});
+
+test("alert allowlisting rejects non-website and unobserved addresses", async () => {
+  const session = await setupAdmin(), headers = { Cookie: session.cookie };
+  const assetId = Number(db.prepare("INSERT INTO assets(name,type,owner,status,address,created_at) VALUES(?,?,?,?,?,?)")
+    .run("Local app", "application", "admin@example.com", "healthy", "app.local", new Date().toISOString()).lastInsertRowid);
+  const alertId = Number(db.prepare("INSERT INTO alerts(asset_id,title,severity,status,evidence,observed_facts,created_at) VALUES(?,?,?,?,?,?,?)")
+    .run(assetId, "Unlinked alert", "medium", "open", "No source event", "Synthetic", new Date().toISOString()).lastInsertRowid);
+  const response = await jsonFetch(`/api/alerts/${alertId}/respond`, { method: "POST", headers, body: JSON.stringify({ action: "allowlist", reason: "test" }) });
+  assert.equal(response.response.status, 409);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM gateway_allowlist").get().n, 0);
+});
+
 test("firewall preview requires authentication, rejects protected CIDRs, and audits management-address changes", async () => {
   const session = await setupAdmin(), cookie = { Cookie: session.cookie };
   const denied = await jsonFetch("/api/firewall/rules", { method: "GET" });
