@@ -1,0 +1,100 @@
+name: Windows release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test-package:
+    runs-on: windows-2022
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v6
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - name: Install development dependencies
+        run: npm install --ignore-scripts --no-audit --no-fund
+      - name: Run tests
+        run: npm test
+      - name: Check JavaScript syntax
+        run: npm run typecheck
+      - name: Verify dashboard assets
+        run: npm run build
+      - name: Verify tag matches package version
+        shell: pwsh
+        run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") {
+            throw "Release tag must be v$version; got $env:GITHUB_REF_NAME"
+          }
+      - name: Build offline installer and release checklist
+        shell: pwsh
+        run: .\scripts\build-release.ps1 -OutputDirectory .\release
+      - name: Upload build artifacts for clean-VM qualification
+        uses: actions/upload-artifact@v7
+        with:
+          name: sentrygate-windows-release-candidate
+          path: |
+            release/SentryGate-*-Windows-x64.zip
+            release/SentryGate-*-Windows-x64.zip.sha256
+            release/INSTALL-WINDOWS.md
+            release/RELEASE-NOTES.md
+            release/RELEASE-CHECKLIST.md
+          if-no-files-found: error
+          retention-days: 30
+
+  publish-github-release:
+    needs: build-test-package
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: windows-2022
+    environment:
+      name: windows-clean-vm-qualified
+    permissions:
+      contents: write
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v6
+      - name: Download tested package artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: sentrygate-windows-release-candidate
+          path: release
+      - name: Publish release assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SENTRYGATE_CLEAN_WINDOWS_VM_VERIFIED: ${{ vars.SENTRYGATE_CLEAN_WINDOWS_VM_VERIFIED }}
+        run: |
+          if ($env:SENTRYGATE_CLEAN_WINDOWS_VM_VERIFIED -ne 'true') {
+            throw 'Release blocked: set the windows-clean-vm-qualified environment variable SENTRYGATE_CLEAN_WINDOWS_VM_VERIFIED=true only after the exact candidate passed the clean-Windows-VM checklist.'
+          }
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $tag = $env:GITHUB_REF_NAME
+          if ($tag -ne "v$version") { throw "Refusing to publish unexpected tag $tag (expected v$version)." }
+          $archive = Join-Path 'release' "SentryGate-$version-Windows-x64.zip"
+          $checksum = "$archive.sha256"
+          $guide = Join-Path 'release' 'INSTALL-WINDOWS.md'
+          $notes = Join-Path 'release' 'RELEASE-NOTES.md'
+          $checklist = Join-Path 'release' 'RELEASE-CHECKLIST.md'
+          foreach ($file in @($archive,$checksum,$guide,$notes,$checklist)) {
+            if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Required release file is missing: $file" }
+          }
+          $line = (Get-Content -LiteralPath $checksum -Raw).Trim()
+          if ($line -notmatch '^([a-fA-F0-9]{64})\s+\*?(.+?)\s*$' -or $Matches[2] -ne (Split-Path $archive -Leaf)) { throw 'Release checksum file is malformed.' }
+          $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash
+          if ($actual -ne $Matches[1]) { throw 'Installer checksum does not match; refusing to publish.' }
+          if (gh release view $tag --repo $env:GITHUB_REPOSITORY 2>$null) {
+            gh release edit $tag --repo $env:GITHUB_REPOSITORY --notes-file $notes
+            if ($LASTEXITCODE -ne 0) { throw 'Could not update GitHub Release notes.' }
+            gh release upload $tag $archive $checksum $guide $notes $checklist --repo $env:GITHUB_REPOSITORY --clobber
+          } else {
+            gh release create $tag $archive $checksum $guide $notes $checklist --repo $env:GITHUB_REPOSITORY --verify-tag --title "SentryGate $tag" --notes-file $notes
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'GitHub Release creation or asset attachment failed.' }

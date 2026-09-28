@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import test, { afterEach, beforeEach } from "node:test";
 import { createServer } from "../src/app.js";
 import { loadConfig } from "../src/config.js";
 import { openDatabase } from "../src/db.js";
-import { expireGatewayActions, validateActionTarget } from "../src/actions.js";
+import { evaluateIncidentPolicies, expireGatewayActions, validateActionTarget } from "../src/actions.js";
 import { correlateEvent } from "../src/incidents.js";
 import { sweepOperationalState } from "../src/operations.js";
 
@@ -48,6 +48,51 @@ test("creates the first administrator with a salted password hash and authentica
   assert.match(setup.cookie, /^sentrygate_session=/);
   assert.match(setup.response.headers.get("set-cookie"), /HttpOnly/);
   assert.match(setup.response.headers.get("set-cookie"), /SameSite=Strict/);
+});
+
+test("keeps browser sessions isolated between local SentryGate ports", async () => {
+  const installations = [4300, 4304].map((port) => {
+    const config = loadConfig({ dbPath: path.join(os.tmpdir(), `sentrygate-cookie-${randomUUID()}.db`), sessionSecret: `cookie-test-secret-for-port-${port}-32bytes`, port, webRoot: path.resolve("apps/web") });
+    const database = openDatabase(config.dbPath);
+    const instance = createServer(database, config);
+    return { config, database, instance };
+  });
+  try {
+    const cookies = [];
+    for (const installation of installations) {
+      await new Promise((resolve) => installation.instance.listen(0, resolve));
+      const address = installation.instance.address();
+      const response = await fetch(`http://127.0.0.1:${address.port}/api/setup`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: "owner@example.test", password: "a sufficiently long local password" })
+      });
+      assert.equal(response.status, 201);
+      cookies.push(response.headers.get("set-cookie").split(";")[0]);
+    }
+    assert.match(cookies[0], /^sentrygate_session_4300=/);
+    assert.match(cookies[1], /^sentrygate_session_4304=/);
+    const otherInstance = installations[1].instance.address();
+    const denied = await fetch(`http://127.0.0.1:${otherInstance.port}/api/assets`, { headers: { Cookie: cookies[0] } });
+    assert.equal(denied.status, 401);
+  } finally {
+    for (const installation of installations) {
+      if (installation.instance.listening) await new Promise((resolve) => installation.instance.close(resolve));
+      installation.database.close();
+    }
+  }
+});
+
+test("storage status is authenticated and exposes local capacity details",async()=>{
+  const anonymous=await jsonFetch("/api/storage");
+  assert.equal(anonymous.response.status,401);
+  const setup=await setupAdmin();
+  const status=await jsonFetch("/api/storage",{headers:{Cookie:setup.cookie}});
+  assert.equal(status.response.status,200);
+  assert.equal(path.isAbsolute(status.body.databasePath),true);
+  assert.equal(path.isAbsolute(status.body.dataDirectory),true);
+  assert.equal(status.body.storageLimitBytes>0,true);
+  assert.equal(status.body.warningPercent>=50,true);
+  assert.equal(typeof status.body.warning,"boolean");
 });
 
 test("rejects cross-origin administrator mutations and external cleartext agent endpoints", async () => {
@@ -282,7 +327,7 @@ function addPolicyIncident(assetId, ip, { deviceId = null, severity = "high", ru
 }
 
 function policyRequest(assetId, targetType, targetId, overrides = {}) {
-  return { name: "Repeated abuse response", assetId, detectionRule: "sensitive_path", minimumSeverity: "high", minimumEventCount: 3,
+  return { name: "Repeated abuse response", mode: "recommend", assetId, detectionRule: "sensitive_path", minimumSeverity: "high", minimumEventCount: 3,
     windowMinutes: 10, targetType, targetId, protocol: "TCP", localPort: 443, durationMinutes: 30, ...overrides };
 }
 
@@ -300,7 +345,7 @@ test("suggestion policies honor thresholds, suppress allowlisted evidence, and n
   const eligibleSite = Number(db.prepare("INSERT INTO assets (name,type,owner,status,address,created_at) VALUES ('Eligible action site','website','admin','healthy','eligible.test',?)").run(new Date().toISOString()).lastInsertRowid);
   const eligibleIncidentId = addPolicyIncident(eligibleSite, "203.0.113.62");
   const eligible = await jsonFetch("/api/action-policies", { method: "POST", headers, body: JSON.stringify(policyRequest(eligibleSite, "website", eligibleSite, { name: "Eligible suggestion" })) });
-  assert.equal(eligible.body.mode, "suggestion-only");
+  assert.equal(eligible.body.mode, "recommend");
   const actions = await jsonFetch("/api/actions", { headers });
   assert.equal(actions.body.length, 1);
   assert.equal(actions.body[0].incidentId, eligibleIncidentId);
@@ -309,6 +354,43 @@ test("suggestion policies honor thresholds, suppress allowlisted evidence, and n
   assert.equal(db.prepare("SELECT COUNT(*) AS count FROM firewall_rules").get().count, 0);
   assert.equal(db.prepare("SELECT COUNT(*) AS count FROM gateway_ip_blocks").get().count, 0);
   assert.equal((await jsonFetch("/api/actions")).response.status, 401);
+});
+
+test("policies default to Observe, Recommend only proposes, Enforce requires two owner gates and obeys block limits", async () => {
+  const session = await setupAdmin(), headers = { Cookie: session.cookie };
+  const asset = Number(db.prepare("INSERT INTO assets (name,type,owner,status,address,created_at) VALUES ('Policy computer','computer','admin','healthy','SG-POLICY-01',?)").run(new Date().toISOString()).lastInsertRowid);
+  const enrolled = await jsonFetch("/api/devices/enroll", { method: "POST", headers, body: JSON.stringify({ name: "Policy agent", hostname: "SG-POLICY-01", osVersion: "Windows test", agentVersion: "0.4.0", assetId: asset }) });
+  assert.equal((await jsonFetch("/api/actions/settings", { headers })).body.enforcementEnabled, 0);
+  addPolicyIncident(asset, "203.0.113.101", { deviceId: enrolled.body.deviceId, rule: "new_listening_port" });
+  const observe = await jsonFetch("/api/action-policies", { method: "POST", headers, body: JSON.stringify(policyRequest(asset, "device", enrolled.body.deviceId, { mode: "observe", detectionRule: "new_listening_port" })) });
+  assert.equal(observe.body.mode, "observe");
+  assert.equal((await jsonFetch("/api/actions", { headers })).body.length, 0);
+  const change = await jsonFetch(`/api/action-policies/${observe.body.id}`, { method: "PATCH", headers, body: JSON.stringify({ mode: "recommend" }) });
+  assert.equal(change.body.mode, "recommend");
+  assert.equal((await jsonFetch("/api/actions", { headers })).body[0].status, "proposed");
+  const restored = await jsonFetch(`/api/action-policies/${observe.body.id}/restore`, { method: "POST", headers, body: "{}" });
+  assert.equal(restored.body.mode, "observe");
+  assert.ok(db.prepare("SELECT 1 FROM audit_log WHERE action='action.policy_restored'").get());
+
+  assert.equal((await jsonFetch("/api/actions/settings", { method: "PUT", headers, body: JSON.stringify({ enforcementEnabled: true }) })).response.status, 400);
+  const enabled = await jsonFetch("/api/actions/settings", { method: "PUT", headers, body: JSON.stringify({ enforcementEnabled: true, confirmed: true, maxActiveBlocks: 1 }) });
+  assert.equal(enabled.body.enforcementEnabled, true);
+  const enforceAsset = Number(db.prepare("INSERT INTO assets (name,type,owner,status,address,created_at) VALUES ('Enforced computer','computer','admin','healthy','SG-ENFORCE-01',?)").run(new Date().toISOString()).lastInsertRowid);
+  const enforceDevice = await jsonFetch("/api/devices/enroll", { method: "POST", headers, body: JSON.stringify({ name: "Enforce test agent", hostname: "SG-ENFORCE-01", osVersion: "Windows test", agentVersion: "0.4.0", assetId: enforceAsset }) });
+  const enforce = await jsonFetch("/api/action-policies", { method: "POST", headers, body: JSON.stringify(policyRequest(enforceAsset, "device", enforceDevice.body.deviceId, { mode: "enforce", detectionRule: "new_listening_port", minimumSeverity: "medium", localPort: 65002 })) });
+  assert.equal(enforce.response.status, 201);
+  assert.equal(enforce.body.mode, "enforce");
+  const firstIncident = addPolicyIncident(enforceAsset, "203.0.113.102", { deviceId: enforceDevice.body.deviceId, rule: "new_listening_port" });
+  for (const item of db.prepare("SELECT id FROM incidents WHERE id=?").all(firstIncident)) evaluateIncidentPolicies(db, item.id);
+  const action = (await jsonFetch("/api/actions", { headers })).body.find((item) => item.incidentId === firstIncident);
+  assert.equal(action.status, "approved");
+  assert.equal(action.autoBlocking, true);
+  assert.equal(action.firewallStatus, "approved");
+  assert.equal(db.prepare("SELECT remote_cidr FROM firewall_rules WHERE action_id=?").get(action.id).remote_cidr, "203.0.113.102/32");
+  const secondIncident = addPolicyIncident(enforceAsset, "203.0.113.103", { deviceId: enforceDevice.body.deviceId, rule: "new_listening_port" });
+  evaluateIncidentPolicies(db, secondIncident);
+  assert.ok((await jsonFetch("/api/actions", { headers })).body.some((item) => item.incidentId === secondIncident && item.status === "failed" && /block limit/.test(item.failure)));
+  await jsonFetch("/api/actions/settings", { method: "PUT", headers, body: JSON.stringify({ enforcementEnabled: false, confirmed: true }) });
 });
 
 test("action proposals enforce protected addresses, explicit approval, idempotency, and one-click gateway rollback", async () => {
@@ -459,6 +541,7 @@ test("enrolls a unique device credential, authenticates reports, and prevents du
   const report = { device: { deviceId, hostname: "SG-WIN-01", osVersion: "Windows 11", agentVersion: "0.3.0" }, timestamp, healthStatus: "healthy",
     processes: [{ pid: 24, parentPid: 1, name: "worker.exe", startedAt: timestamp }],
     connections: [{ pid: 24, protocol: "TCP", state: "Listen", localAddress: "0.0.0.0", localPort: 9443, remoteAddress: "0.0.0.0", remotePort: 0, timestamp }],
+    services: [{ name: "SentryGateAgent", displayName: "SentryGate Windows Agent", state: "Running", startMode: "Auto", processId: 99 }],
     events: [{ eventId: "stable-demo-id", timestamp, category: "endpoint-detection", rule: "new_listening_port", title: "New listening TCP port", severity: "medium", reason: "Listener appeared at 0.0.0.0:9443", evidence: { endpoint: "0.0.0.0:9443", pid: 24 }, processDetails: "PID 24 worker.exe" }] };
   const invalid = await jsonFetch(`/api/devices/${deviceId}/report`, { method: "POST", body: JSON.stringify(report) });
   assert.equal(invalid.response.status, 401);
@@ -470,6 +553,9 @@ test("enrolls a unique device credential, authenticates reports, and prevents du
   assert.equal(db.prepare("SELECT COUNT(*) AS count FROM alerts WHERE device_id=?").get(deviceId).count, 1);
   const device = await jsonFetch(`/api/devices/${deviceId}`, { headers });
   assert.equal(device.body.processes[0].pid, 24);
+  assert.equal(device.body.agentServiceState, "Running");
+  assert.equal(device.body.agentServiceStartMode, "Auto");
+  assert.equal((await jsonFetch("/api/devices", { headers })).body.find((entry) => entry.deviceId === deviceId).agentServiceState, "Running");
   const filtered = await jsonFetch(`/api/events?deviceId=${deviceId}&severity=medium&from=${timestamp.slice(0, 10)}&to=${timestamp.slice(0, 10)}`, { headers });
   assert.equal(filtered.body.length, 1);
   const alertFiltered = await jsonFetch(`/api/alerts?deviceId=${deviceId}&severity=medium`, { headers });
@@ -500,11 +586,12 @@ test("Milestone 7 isolates computer assets, queues configuration retries, enforc
   assert.notEqual(first.body.assetId, second.body.assetId);
   const assetA = await jsonFetch(`/api/assets/${first.body.assetId}`, { headers: ownerHeaders });
   assert.equal(assetA.body.asset.deviceId, first.body.deviceId);
-  const settings = { collectProcesses: false, collectConnections: true, intervalSeconds: 30, outboundConnectionThreshold: 55, retainedDays: 30 };
+  const settings = { collectProcesses: false, collectConnections: true, collectApplications: true, collectServices: true, collectStartup: false, collectSecurity: true, intervalSeconds: 30, outboundConnectionThreshold: 55, retainedDays: 30 };
   assert.equal((await jsonFetch(`/api/devices/${first.body.deviceId}/settings`, { method: "PUT", headers: ownerHeaders, body: JSON.stringify(settings) })).response.status, 200);
   const deviceAuth = { Authorization: `Bearer ${first.body.credential}` };
   const config = await jsonFetch(`/api/devices/${first.body.deviceId}/config`, { headers: deviceAuth });
   assert.equal(config.body.configVersion, 2);
+  assert.equal(config.body.collectStartup, false);
   assert.equal(db.prepare("SELECT status FROM device_config_updates WHERE device_id=? AND version=2").get(first.body.deviceId).status, "pending");
   await jsonFetch(`/api/devices/${first.body.deviceId}/config`, { headers: deviceAuth });
   assert.equal(db.prepare("SELECT attempts FROM device_config_updates WHERE device_id=? AND version=2").get(first.body.deviceId).attempts, 2);
@@ -568,4 +655,45 @@ test("health check fails closed with a generic response when SQLite is unavailab
   await new Promise(resolve=>isolated.listen(0,"127.0.0.1",resolve));
   try{const response=await fetch(`http://127.0.0.1:${isolated.address().port}/api/health`);assert.equal(response.status,500);assert.deepEqual(await response.json(),{error:"Internal server error"});}
   finally{await new Promise(resolve=>isolated.close(resolve));}
+});
+
+test("application firewall stays preview-only, enforces owner permissions, and queues a device-scoped approved command", async () => {
+  const session = await setupAdmin(), headers = { Cookie: session.cookie };
+  const assetId = Number(db.prepare("INSERT INTO assets(name,type,owner,status,address,description,created_at) VALUES('Test PC','computer','admin@example.com','healthy','TEST-PC','','2026-09-27T00:00:00Z')").run().lastInsertRowid);
+  const deviceId = randomUUID(), token = "a-secure-agent-token-for-tests-1234567890";
+  db.prepare(`INSERT INTO device_agents(device_id,name,hostname,os_version,agent_version,credential_hash,enrolled_at,asset_id,last_heartbeat)
+    VALUES(?,?,?,?,?,?,?,?,?)`).run(deviceId, "Test agent", "TEST-PC", "Windows 11", "1.0", createHash("sha256").update(token).digest("hex"), new Date().toISOString(), assetId, new Date().toISOString());
+  const programPath = "C:\\Program Files\\Example\\service.exe";
+  db.prepare("INSERT INTO device_snapshots(device_id,captured_at,processes_json,connections_json) VALUES(?,?,?,?)")
+    .run(deviceId, new Date().toISOString(), JSON.stringify([{ pid: 77, name: "service.exe", executablePath: programPath }]), "[]");
+  assert.equal((await jsonFetch("/api/firewall/enforcement", { headers })).body.enabled, false);
+  db.prepare("UPDATE admins SET role='read_only_viewer' WHERE email='admin@example.com'").run();
+  const forbidden = await jsonFetch("/api/firewall/enforcement", { method: "PUT", headers, body: JSON.stringify({ enabled: true, confirmed: true }) });
+  assert.equal(forbidden.response.status, 403);
+  db.prepare("UPDATE admins SET role='owner' WHERE email='admin@example.com'").run();
+  const input = { deviceId, applicationName: "service.exe", programPath, mode: "block", reason: "Simulated inbound exposure", evidence: "Synthetic test inventory only", expiresAt: new Date(Date.now() + 300_000).toISOString(), idempotencyKey: randomUUID() };
+  const proposal = await jsonFetch("/api/application-policies/preview", { method: "POST", headers, body: JSON.stringify(input) });
+  assert.equal(proposal.response.status, 201);
+  assert.match(proposal.body.preview.expectedEffect, /Block inbound network access/);
+  const blockedApproval = await jsonFetch(`/api/application-policies/${proposal.body.policy.id}/approve`, { method: "POST", headers, body: JSON.stringify({ confirmed: true }) });
+  assert.equal(blockedApproval.response.status, 409);
+  const enabled = await jsonFetch("/api/firewall/enforcement", { method: "PUT", headers, body: JSON.stringify({ enabled: true, confirmed: true }) });
+  assert.equal(enabled.response.status, 200);
+  const approved = await jsonFetch(`/api/application-policies/${proposal.body.policy.id}/approve`, { method: "POST", headers, body: JSON.stringify({ confirmed: true }) });
+  assert.equal(approved.body.status, "approved");
+  const config = await jsonFetch(`/api/devices/${deviceId}/config`, { headers: { Authorization: `Bearer ${token}` } });
+  assert.equal(config.response.status, 200);
+  assert.equal(config.body.applicationPolicyCommand.policies[0].programPath, programPath);
+  assert.equal(config.body.applicationPolicyCommand.policies[0].action, "Block");
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM firewall_rules WHERE device_id=?").get(deviceId).n, 0);
+  assert.ok(db.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE target=? AND action LIKE 'firewall.application_policy_%'").get(`application-policy:${proposal.body.policy.id}`).n >= 2);
+  const rollback = await jsonFetch(`/api/application-policies/${proposal.body.policy.id}/rollback`, { method: "POST", headers, body: JSON.stringify({ confirmed: true }) });
+  assert.equal(rollback.body.status, "removing");
+  const removal = await jsonFetch(`/api/devices/${deviceId}/config`, { headers: { Authorization: `Bearer ${token}` } });
+  assert.equal(removal.body.applicationPolicyCommand.policies[0].operation, "remove");
+  const helperFailure = { results: [{ id: proposal.body.policy.id, status: "failed", detail: "Mock helper could not confirm rule removal", actualState: { group: "SentryGate", present: true } }] };
+  const deviceHeaders = { Authorization: `Bearer ${token}` };
+  assert.equal((await jsonFetch(`/api/devices/${deviceId}/application-policy-state`, { method: "POST", headers: deviceHeaders, body: JSON.stringify(helperFailure) })).response.status, 200);
+  await jsonFetch(`/api/devices/${deviceId}/application-policy-state`, { method: "POST", headers: deviceHeaders, body: JSON.stringify(helperFailure) });
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM alerts WHERE title='SentryGate application firewall rule changed' AND device_id=?").get(deviceId).n, 1);
 });

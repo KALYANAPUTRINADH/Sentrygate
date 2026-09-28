@@ -8,7 +8,7 @@ import { createServer as createApiServer } from "../src/app.js";
 import { ensureAgentCredential } from "../src/agent-credentials.js";
 import { loadConfig } from "../src/config.js";
 import { openDatabase } from "../src/db.js";
-import { createGatewayServer } from "../src/gateway.js";
+import { createGatewayServer, flushGatewayOutbox } from "../src/gateway.js";
 
 let db;
 let config;
@@ -220,17 +220,23 @@ test("returns 501 and records unsupported WebSocket upgrade attempts", async () 
   assert.equal(event.action, "unsupported");
 });
 
-test("enforcement telemetry outage follows the website's configured fail-open or fail-closed behavior", async () => {
+test("backend outage is durably queued while storage-capacity failures follow the website failure mode", async () => {
   config.apiBaseUrl="http://127.0.0.1:1";
   setProtection({mode:"block",failureMode:"open"});
   const hits=upstreamHits;
   const open=await request("/.env");
-  assert.equal(open.status,200);
-  assert.equal(upstreamHits,hits+1);
+  assert.equal(open.status,403);
+  assert.equal(upstreamHits,hits);
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM gateway_event_outbox").get().count,1);
   setProtection({mode:"block",failureMode:"closed"});
   const closed=await request("/.env");
-  assert.equal(closed.status,503);
-  assert.equal(upstreamHits,hits+1);
+  assert.equal(closed.status,403);
+  assert.equal(upstreamHits,hits);
+  config.gatewayOutboxMaxEvents=1;
+  const full=await request("/.env");
+  assert.equal(full.status,503);
+  assert.equal(upstreamHits,hits);
+  delete config.gatewayOutboxMaxEvents;
 });
 
 test("reports unavailable upstream with 502 and event evidence", async () => {
@@ -247,4 +253,31 @@ test("reports unavailable upstream with 502 and event evidence", async () => {
   assert.equal(event.detection_rule, "upstream_unavailable");
   assert.equal(event.action, "upstream-error");
   assert.equal(event.response_status, 502);
+});
+
+test("gateway refuses to send event evidence to a public API destination",async()=>{
+  const previous=config.apiBaseUrl;
+  const hits=upstreamHits;
+  config.apiBaseUrl="https://8.8.8.8";
+  const response=await request("/ordinary");
+  assert.equal(response.status,200);
+  assert.equal(upstreamHits,hits+1);
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM events WHERE asset_id=?").get(assetId).count,0);
+  config.apiBaseUrl=previous;
+});
+
+test("gateway durably buffers local events while backend is offline and retries idempotently",async()=>{
+  const previous=config.apiBaseUrl;
+  config.apiBaseUrl="https://8.8.8.8";
+  const response=await request("/.env");
+  assert.equal(response.status,200);
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM gateway_event_outbox").get().count,1);
+  config.apiBaseUrl=previous;
+  const first=await flushGatewayOutbox(db,config);
+  const second=await flushGatewayOutbox(db,config);
+  assert.equal(first.sent,1);
+  assert.equal(first.pending,0);
+  assert.equal(second.sent,0);
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM gateway_event_outbox").get().count,0);
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM events WHERE source='website-gateway'").get().count,1);
 });

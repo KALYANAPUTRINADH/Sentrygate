@@ -1,6 +1,19 @@
 # SentryGate
 
-SentryGate is a local-first security dashboard for systems you own or administer. The enrolled Windows endpoint agent reports process and TCP connection metadata and explainable observe-only alerts. Milestone 4 adds manually approved, narrowly scoped firewall rules; it does not create automatic blocks, terminate processes, inspect file contents, capture keystrokes, read passwords, inspect browser history, or decrypt network traffic.
+SentryGate is designed for a separate, loopback-only installation on each computer. It requires no central server, domain, cloud service, or internet after the package is copied locally. See [Windows install](INSTALL-WINDOWS.md) and [macOS/Linux install](INSTALL-UNIX.md) for platform-specific commands and limitations. The isolated two-installation test is `npm run test:standalone`.
+
+SentryGate is local-first: security records stay in the configured host-local SQLite data directory; no cloud database/object storage, analytics, crash uploads, or external AI API is used. See [local storage, backup, offline behavior, and network destinations](docs/local-only-privacy.md). SQLite is not internally encrypted; use BitLocker/full-volume encryption and restrictive ACLs.
+
+Configure local storage on Windows after creating `.env` from `.env.example`:
+
+```powershell
+if (-not (Test-Path -LiteralPath .env)) { Copy-Item .env.example .env } else { Write-Host 'Preserving existing .env configuration.' }
+.\scripts\configure-storage.ps1 -DataDirectory 'D:\SentryGate\Data' -MaxDatabaseBytes 2147483648 -WarningPercent 80 -MinimumFreeDiskBytes 1073741824
+```
+
+The script updates only storage settings and preserves other `.env` values. It does not move existing data; stop SentryGate, back up and verify locally, migrate/restore the DB into the chosen directory, then restart. In the Settings page, check the displayed path, usage, cap, and free-space warning.
+
+SentryGate is a local-first security dashboard and endpoint agent for systems you own or administer. The agent reports host and network metadata and explainable findings; it starts in Observe mode and does not terminate processes or block traffic automatically. Firewall changes are separate, locally approved features and remain preview-only by default. The agent does not inspect file contents, capture keystrokes, read passwords, inspect browser history, or decrypt network traffic.
 
 ## Project layout
 
@@ -8,13 +21,75 @@ SentryGate is a local-first security dashboard for systems you own or administer
 apps/
   api/                 Node API, SQLite migrations, website gateway, tests, demo commands
   web/                 Vanilla JavaScript dashboard
-  agent/               Windows CIM/TCP collector, detection, DPAPI spool, service scripts
-packages/shared/       Shared contract notes
+  agent/               OS collectors, explainable detection, protected event spool, service integrations
+packages/shared/       Shared contracts and local/private network policy
+scripts/               Windows lifecycle, offline packaging, and storage helpers
 docs/                  Threat model and deployment instructions
 .env.example           Local configuration template
 ```
 
-The stack uses Node.js 24+, built-in `node:sqlite`, built-in HTTP, and no npm runtime dependencies. The API/database and gateway run locally. The Windows service host is built from the included C# source using the .NET Framework compiler.
+The stack uses Node.js 24+, built-in `node:sqlite`, built-in HTTP, and no npm runtime dependencies. The API/database and dashboard run locally. Windows uses a Windows service; macOS uses launchd; Linux uses systemd. Platform coverage is not identical; see the agent matrix below and [platform installation status](INSTALL-UNIX.md#platform-status).
+
+## Agent Features and Platform Coverage
+
+The SentryGate agent is an explicitly enrolled, per-computer service. It samples metadata at a configurable interval (30 seconds by default), sends authenticated reports to that computer's local SentryGate API, and queues reports locally during an API outage. Device identity and health appear under **Devices**. The agent works independently of whether the dashboard window is open, provided its OS service is installed and running.
+
+| Signal or feature | What is collected / source | Detection and evidence | Windows | macOS | Linux |
+|---|---|---|---|---|---|
+| Device identity and health | Hostname, OS version, agent version, heartbeat time, collection/report health | Stale heartbeat and repeated report-delivery failures; delivery failure is raised after three consecutive failures | Implemented | Implemented in shared agent | Implemented in shared agent |
+| Process inventory | PID, parent PID, start time, process name; OS process listing APIs/commands | Links observed listeners/connections to a PID and process name; no automatic process action | PowerShell/CIM collector; richer metadata | `ps`; executable path omitted | `ps`; executable path omitted |
+| Connections and listening ports | Timestamp, PID when available, protocol/state, local and remote endpoint | New listener vs prior sample; unusually many established non-local connections per PID (default threshold 40) | PowerShell networking APIs | `lsof` output | `ss` output; PID may be unavailable without sufficient permission |
+| Services | Service name, state and start mode where available | Windows security-service state checks; platform firewall status may also produce a finding | Windows service inventory | `launchctl list` running-service metadata | Running `systemd` service metadata |
+| Installed applications | Installed application metadata | No detection rule currently uses this inventory | Collected | Not implemented | Not implemented |
+| Startup entries | Startup name/path/source | New startup entry vs prior sample | Collected and compared to a saved baseline | Not implemented | Not implemented |
+| Security controls | Firewall state and Windows Defender real-time status where available | Newly observed disabled firewall profile, Defender real-time protection, or selected Windows security service produces an evidence-backed high finding | Windows firewall profiles, Defender status, and selected services | macOS Application Firewall global status only | `nftables`, `ufw`, and `firewalld` status where installed |
+
+Detection is intentionally explainable, not an identity or attribution system. A new listener, high connection count, or disabled control is an observation that may be expected on a particular computer; review the exact event evidence and context before treating it as suspicious. An IP address or process name does not establish who caused activity. Rules and thresholds are configurable where exposed by the device settings. Unsupported or permission-limited collectors report collection errors/degraded health rather than asserting that data was collected.
+
+Credentials and queued event payloads are protected at rest: Windows uses DPAPI; macOS/Linux use AES-256-GCM with a separate local key file whose permissions are restricted. Protect the host disk (BitLocker/FileVault/LUKS) and agent data directory. The dashboard/API are loopback-only for standalone installs; the agent connects to the local API. No cloud service, telemetry, or external AI API is required.
+
+### Run from GitHub source
+
+These are development/source commands, not an installer. The repository requires Node.js 24+ and Git; npm dependencies are not needed for runtime. The GitHub repository is `KALYANAPUTRINADH/Sentrygate`. Clone the committed branch, run checks, and start the local dashboard/API:
+
+```powershell
+git clone https://github.com/KALYANAPUTRINADH/Sentrygate.git
+Set-Location Sentrygate
+npm test
+npm run typecheck
+npm run dev
+```
+
+On macOS/Linux, use the same `git clone`, `cd Sentrygate`, `npm test`, `npm run typecheck`, and `npm run dev` commands in Terminal. Open `http://127.0.0.1:4300`, create the local owner account, then enroll this computer from **Devices**. For a safe synthetic event, run `npm run demo:agent` in another terminal; it is marked simulated and does not enroll or monitor the host.
+
+### Run the actual agent
+
+For Windows foreground development, first enroll the computer in the local dashboard. In PowerShell, configure its one-time credential securely, then run the collector:
+
+```powershell
+$deviceId = Read-Host 'Device ID from SentryGate'
+& .\apps\agent\scripts\configure-agent.ps1 -DeviceId $deviceId -ApiBaseUrl 'http://127.0.0.1:4300' -AgentRoot "$env:LOCALAPPDATA\SentryGate\Agent"
+npm run agent:dev
+```
+
+The configuration script prompts for the credential without echoing it. For boot-time Windows service installation and lifecycle, use [INSTALL-WINDOWS.md](INSTALL-WINDOWS.md); service registration requires administrator approval.
+
+On macOS or Linux, the source agent can be run in the foreground after enrolling the computer. Build the target-OS bundle first because its Node.js runtime is OS-specific; see [INSTALL-UNIX.md](INSTALL-UNIX.md#build-a-transferable-package-on-each-os). In the installed bundle, configure the device ID and enter the credential through the hidden prompt, then run the agent:
+
+```sh
+sudo env SENTRYGATE_AGENT_DATA=/var/lib/sentrygate-agent \
+  /opt/sentrygate/runtime/sentrygate-node \
+  /opt/sentrygate/apps/agent/scripts/configure-agent-unix.mjs \
+  '<local-device-guid>' http://127.0.0.1:4300
+sudo env SENTRYGATE_AGENT_CONFIG=/var/lib/sentrygate-agent/config.json \
+  /opt/sentrygate/runtime/sentrygate-node /opt/sentrygate/apps/agent/src/agent.js
+```
+
+For continuous boot-time operation, install the platform service using the remaining steps in [INSTALL-UNIX.md](INSTALL-UNIX.md#service-commands). Linux/macOS service setup and firewall adapters have not been verified on native Linux/macOS computers in this workspace. Building a platform-specific package or passing mocked tests is not native platform verification.
+
+### Does it run correctly on every computer type?
+
+Not yet verified across all platforms. This checkout runs on Windows and has Windows collector/tests and packaged API smoke coverage, but a clean-machine Windows service reboot/crash lifecycle has not been completed. macOS and Linux collector/parser tests are mocked and their install scripts are present, but this workspace has not run those installers or services on actual macOS/Linux hosts. Some inventory features are intentionally missing on those platforms, as shown in the matrix. Treat macOS/Linux as experimental until native install, permissions, service recovery, offline buffering, and uninstall are tested on each target OS and architecture. A GitHub source clone does not make the Windows installer portable to macOS/Linux; packages must be built for their target OS/architecture. There is no basis to claim universal compatibility today.
 
 Milestone 8 adds HTTPS listeners for controlled deployment, session revocation and sign-in throttling, per-site gateway outage behavior, bounded local/API storage with scheduled retention, structured operational logs, SQLite backup/restore, heartbeat alerts, and an isolated synthetic load test. Local loopback HTTP remains available only for development. See [the controlled-pilot deployment runbook](docs/deployment.md) and [updated threat model](docs/threat-model.md); this is not a production-readiness certification.
 
@@ -34,6 +109,43 @@ npm run dev
 ```
 
 Open [http://127.0.0.1:4300](http://127.0.0.1:4300). The first visit prompts you to create the administrator; there is no default password. Passwords are stored as salted scrypt hashes. Keep `.env` and `apps/api/data` private. The dashboard/API and website gateway bind to loopback by default.
+
+## Local Installation Runtime
+
+The installer package has no npm runtime dependencies. It includes a portable Node.js runtime and uses Node's built-in SQLite, HTTP(S), and cryptography modules. Node.js 24+ and npm are needed only for development, tests, and creating the offline package. The Windows agent's optional service installer additionally needs the Windows .NET Framework C# compiler. No runtime internet access is required for the dashboard, API, database, or local analysis worker.
+
+For a local install from this checkout, create `.env` only when it does not already exist, then start the complete local application:
+
+```powershell
+if (-not (Test-Path -LiteralPath .env)) { Copy-Item .env.example .env }
+.\scripts\start-sentrygate.ps1
+```
+
+Open `http://127.0.0.1:4300`. The script uses `%LOCALAPPDATA%\SentryGate\Data` for SQLite and `%LOCALAPPDATA%\SentryGate\Runtime` for logs and process state; it generates and DPAPI-protects a session secret when one is not configured. The API and website gateway bind to `127.0.0.1`; local analysis runs as a separate process and can be disabled in Settings.
+
+```powershell
+.\scripts\health-sentrygate.ps1
+.\scripts\stop-sentrygate.ps1
+```
+
+Make a local backup and restore it with explicit confirmation (restore stops and restarts the application):
+
+```powershell
+$backup = Join-Path $env:LOCALAPPDATA "SentryGate\Backups\sentrygate-$(Get-Date -Format yyyyMMdd-HHmmss).db"
+New-Item -ItemType Directory -Force (Split-Path $backup) | Out-Null
+.\scripts\backup-sentrygate.ps1 -OutputFile $backup
+.\scripts\restore-sentrygate.ps1 -Source $backup -Confirm
+```
+
+To stage a self-contained offline runtime package, run this on a development machine with Node.js 24+:
+
+```powershell
+.\scripts\package-local.ps1 -OutputDirectory 'D:\SentryGate-Offline'
+```
+
+Transfer that directory using your approved offline process. On the target computer, start it with `& 'D:\SentryGate-Offline\scripts\start-sentrygate.ps1'`; the bundled Node executable is used and no npm install is performed. Configure storage, backups, and restore with scripts under `scripts`. Backups must remain on a local filesystem. See [local-only privacy and network behavior](docs/local-only-privacy.md).
+
+The standalone Windows installer forcibly disables remote dashboard/API access and binds to loopback; environment overrides cannot change that. The following source-tree deployment setting is only for operators deliberately running the repository's optional multi-host development topology, not the per-computer installer. In that source mode, remote access requires `SENTRYGATE_REMOTE_ACCESS_ENABLED=true`, a certificate and matching key, and a private interface binding. Never expose that listener directly to the public internet.
 
 If the default ports are occupied, set alternate ports before starting the API. For example, this workspace currently runs the dashboard/API on `4301` and gateway on `4312`:
 
@@ -73,28 +185,56 @@ The dashboard is configured to collect process metadata, TCP connection metadata
 
 ### Install as a Windows service
 
-Enrollment happens in the dashboard first. Open **an elevated PowerShell session** on the target computer in the repository directory and run:
+Enrollment happens in the dashboard first. On the target computer, create an owner-approved enrollment credential. Run the following from **elevated PowerShell** in the repository root. The installer verifies `/api/health` and the database before creating the service, accepts only loopback HTTP for this local installation, and refuses to overwrite a matching enrollment or partially present identity files. The service waits for the backend at startup and retries every five seconds if it is temporarily unavailable. It runs as `NT AUTHORITY\LocalService`, uses bundled Node when present, starts automatically after reboot, and has SCM crash recovery (5, 15, then 60 seconds). The monitoring service does not require the separate firewall helper.
 
 ```powershell
 $deviceId = Read-Host 'Device ID from SentryGate'
 & .\apps\agent\scripts\install-agent.ps1 -DeviceId $deviceId -ApiBaseUrl 'http://127.0.0.1:4300'
-Get-Service SentryGateAgent
+Get-Service -Name SentryGateAgent
+sc.exe qc SentryGateAgent
+sc.exe qfailure SentryGateAgent
 ```
 
-Administrator permission is required to register the service and protect its credential for the machine. Program files go under `%ProgramFiles%\SentryGate\Agent`; DPAPI-protected configuration and the event queue go under `%ProgramData%\SentryGate\Agent`, with access restricted to LocalService, SYSTEM, and Administrators. The service runs as LocalService, not LocalSystem. It requires Node.js 24+ and the .NET Framework C# compiler. Use HTTPS for a remote API; plain HTTP is suitable only for loopback development.
+Administrator permission is required to register the service, set recovery actions/ACLs, and protect its credential with machine DPAPI. Program files go under `%ProgramFiles%\SentryGate\Agent`; protected configuration, baseline, and encrypted event queue go under `%ProgramData%\SentryGate\Agent`. Bounded service logs are written to `%ProgramData%\SentryGate\Agent\logs\service.log` with up to four 2 MiB generations. The installer preserves the app/shared module layout so it runs from the offline package without npm or network access. If no bundled Node runtime is present, Node.js 24+ and the .NET Framework C# compiler are required at install time. Firewall enforcement remains disabled; do not pass `-EnableFirewallManagement` for ordinary monitoring.
+
+To check, start, stop, or uninstall the agent from elevated PowerShell:
+
+```powershell
+& .\apps\agent\scripts\agent-service.ps1 -Action Status
+& .\apps\agent\scripts\agent-service.ps1 -Action Start
+& .\apps\agent\scripts\agent-service.ps1 -Action Restart
+& .\apps\agent\scripts\agent-service.ps1 -Action Stop
+& .\apps\agent\scripts\uninstall-agent.ps1
+```
+
+The registered service name is `SentryGateAgent`. `agent-service.ps1 -Action Status` prints the actual SCM state/start mode and the last service log lines. The backend itself is a separate local process/service managed by the local installation; it must be available at the configured API URL before the agent begins collection. To check the backend independently, run `Invoke-RestMethod http://127.0.0.1:4300/api/health` and verify `ok: true` and `database: ready` (substitute the actual configured API port, such as `4304`).
+
+Uninstall removes the monitoring and optional firewall-helper services and SentryGate-owned temporary rules only. It keeps enrollment data by default; add `-RemoveData` only when you also intend to delete the local protected spool/configuration. Revoke the device credential from **Devices**. Windows Firewall itself is never disabled.
+
+### Observe, Recommend, and Enforce
+
+Every new policy starts in **Observe**. Observe records evidence and alerts only; Recommend creates a specific expiring proposal for owner review; Enforce is restricted to an enrolled computer and requires both an individually enabled Enforce policy and a separate owner-confirmed global gate. The global Enforce gate defaults off, including on upgrades. Before enabling it, install and verify the separate privileged firewall helper; the helper remains independently controlled from the dashboard. A policy action is scoped to the incident's observed single IP, one destination computer, protocol/port, threshold/window, and expiry. Protected management/backend/trusted-proxy addresses and existing website allowlists are rechecked, and no more than ten active temporary blocks are permitted by default (the owner may set a 1–50 cap on the Actions page). The system only creates SentryGate-owned inbound rules, verifies state on agent sync, expires/removes them, and records rollback state. Emergency pause stops future automated actions; existing temporary rules remain until expiry or rollback. The Actions page supports restoring the previous enabled/mode policy state, recorded in audit history.
+
+Run the isolated local demonstration to see Observe record events without proposing, then Recommend create a pending action with no firewall or gateway change:
+
+```powershell
+npm run demo:policy-modes
+```
+
+The demo uses an in-memory database and synthetic documentation-range IPs. Enforce stays disabled and no operating-system firewall API is called.
 
 ### Firewall management (Milestone 4)
 
 Firewall management is preview-only until an administrator explicitly approves a specific rule in **Firewall**. Automatic rule creation is disabled. Rules are inbound blocks only, scoped to one IP/CIDR, TCP/UDP port, enrolled device, and mandatory expiry (maximum one year). Loopback, the configured API address, and administrator management IPs are rejected. Add management IPs on the Firewall page before proposing rules. The agent receives approved policy using its per-device credential, stores the policy with DPAPI, removes expired rules locally while offline, and reports observed Windows rule state when connected.
 
-The default service remains LocalService and cannot apply firewall rules. To opt into firewall management on a device you administer, reinstall the agent from **elevated PowerShell** and explicitly confirm the installer prompt. This runs the entire agent as LocalSystem, a broad privilege increase; use the foreground agent for preview/testing and only enable the service option when needed:
+The monitoring agent remains `LocalService`. To opt into firewall management on a device you administer, install the separate `SentryGateFirewallHelper` from **elevated PowerShell** with the explicit switch and interactive confirmation. The helper alone runs as LocalSystem; the monitoring agent is still configured as LocalService:
 
 ```powershell
 & .\apps\agent\scripts\uninstall-agent.ps1
 & .\apps\agent\scripts\install-agent.ps1 -DeviceId $deviceId -ApiBaseUrl 'http://127.0.0.1:4300' -EnableFirewallManagement
 ```
 
-The Windows adapter uses supported `NetSecurity` PowerShell cmdlets. It creates only inbound Block rules with the `SentryGate` group, a generated `SentryGate-<rule-id>` name, and a managed-rule description. It never disables Windows Firewall. If an existing owned identifier has filters different from the approved preview, it reports failure rather than overwriting it. Rollback and expiry are queued until an authenticated agent sync; the dashboard shows pending state and then the device-reported result. The service must be running to enforce expiry while the backend is unavailable.
+The Windows adapter uses supported `NetSecurity` PowerShell cmdlets. It creates only SentryGate-owned inbound rules with generated `SentryGate-<rule-id>` or `SentryGate-App-<policy-id>` names and managed-rule descriptions. Application allow/block policies affect inbound traffic for one observed executable only. It never disables Windows Firewall. If an existing owned identifier has filters different from the approved preview, it reports failure rather than overwriting it. The helper's local timer removes newly created expired owned rules even while the backend is unavailable; the dashboard reconciles the reported OS state when the agent reconnects. The helper must remain running for offline expiry cleanup.
 
 #### Harmless Windows verification
 
@@ -222,3 +362,112 @@ npm run build
 Existing gateway behavior remains available: `npm run sample:site` starts the local HTTP upstream, and `npm run demo:gateway` runs the safe gateway smoke test. WebSocket upgrades are not supported by the website gateway. Do not route a production domain through this local development setup.
 
 Review [docs/threat-model.md](docs/threat-model.md), [docs/deployment.md](docs/deployment.md), and [docs/pilot.md](docs/pilot.md) before deployment. Milestone 9 adds a safe loopback simulation, pilot preflight checks, dashboard measurements, JSON reports, and a scoped rollback command. Do not route a live website until local and staging gates pass and you approve the change. Firewall changes remain administrator-approved only; SentryGate does not create automatic blocks or disable the existing firewall.
+
+### Offline local analysis (Milestone 10)
+
+Offline analysis is optional and disabled by default. It reads only event metadata already in the local SQLite database; it does not install or download a model, call a cloud AI API, collect additional host data, or enforce firewall rules. The API, gateway, and Windows agent are separate processes and continue independently if the analysis worker is stopped. Analysis produces reviewable leads only.
+
+Start the dashboard/API in one PowerShell terminal:
+
+```powershell
+npm run dev
+```
+
+Create the administrator on first use, then open **Offline Analysis** and configure thresholds, batch size, polling, retention, and enablement. In another terminal start the optional worker:
+
+```powershell
+npm run analysis:worker
+```
+
+Alternative local controls (same `.env` and database path as the API):
+
+```powershell
+npm run analysis:status
+npm run analysis:enable
+npm run analysis:disable
+```
+
+Enabling analysis does not start its worker; run `npm run analysis:worker` separately. Ctrl+C stops only the worker. The worker stores its event-ID cursor and findings in SQLite, reads at most the configured batch size (maximum 500), uses idempotent finding keys, and resumes after a restart. Finding retention is configurable on **Offline Analysis**; raw events remain governed by existing event retention. Feedback changes threshold multipliers only after at least three reviews per rule category; false-positive-heavy feedback raises thresholds by 25%, useful-heavy feedback lowers them by 10%, and the base settings remain visible.
+
+The explainable rules group repeated sensitive-path events by asset and gateway-observed endpoint, compare per-endpoint request windows against a rolling local history plus a configured floor, and compare Windows outbound-connection-volume event metadata against a process-name history or configured floor. Evidence snapshots include event IDs and observed fields. The displayed 0–100 heuristic score is not a calibrated attack probability. Results are not proof of attack, intent, or identity. Connection baselines are necessarily sparse because this milestone analyzes event rows and does not turn routine process snapshots into new events. If event retention removes source rows, the finding snapshot remains until its own retention expires.
+
+Run the documented synthetic resource measurement from PowerShell:
+
+```powershell
+npm run analysis:benchmark
+npm run analysis:benchmark -- 10000
+```
+
+The benchmark creates and deletes an isolated temporary SQLite database, measures elapsed analysis time, throughput, p95 batch latency, process CPU time, RSS growth, and database bytes, and generates synthetic normal traffic, baseline windows, a request burst, and sensitive-path events. Results are specific to the local machine and synthetic sample; they are not a capacity promise. Statistical baselines need comparable event history and have limited value for new endpoints or sparse hosts. The current analyzer does not inspect packet contents, derive identity, use ML, create proposed actions, or analyze process snapshots beyond events already stored.
+
+### Windows host security controls (Milestone 11)
+
+The endpoint inventory uses Windows CIM (`Win32_Process`, `Win32_Service`), `Get-NetTCPConnection`, uninstall and startup registry metadata, startup-folder file names, `Get-NetFirewallProfile`, and `Get-MpComputerStatus`. It reports executable paths and process IDs to map listening sockets to processes. It does not use `Win32_Product`, read file contents, collect process command lines or startup arguments, inspect browser/application contents, record keystrokes, or inspect passwords. Collection for each inventory class is independently configurable from **Devices → device → Collection settings**; event retention uses that device's existing retention setting.
+
+**Windows permissions by feature**
+
+- Foreground development and ordinary inventory need a supported Windows PowerShell, Node.js 24+, and access under the current user to query current-user uninstall/Run registry keys, CIM metadata, TCP metadata, service metadata, and startup-folder names. Some Defender or firewall status providers may be unavailable to a non-admin identity; the agent records that limitation rather than changing the setting.
+- Installed service mode requires one elevated PowerShell install to copy application files under Program Files, create ProgramData storage, configure DPAPI-protected credentials, and register `SentryGateAgent` as `NT AUTHORITY\LocalService` with a dedicated Windows service SID. The protected data directory and helper pipe grant access to that service SID rather than all LocalService processes. This monitoring service is not LocalSystem and does not need administrator privileges for its ordinary reporting loop.
+- Actual firewall application-policy changes are optional. Installing `SentryGateFirewallHelper` requires the separate `-EnableFirewallManagement` switch and an interactive `INSTALL HELPER` confirmation from elevated PowerShell. That helper runs as LocalSystem because supported Windows Firewall cmdlets require elevation. Only the dedicated agent service SID can call its named pipe or read its DPAPI-protected HMAC key; the helper rejects replayed/expired envelopes, validates each command, and invokes the fixed SentryGate firewall script. A local helper sweep removes expired, ownership-marked rules every 30 seconds, including while the backend is unavailable; the dashboard's last reported state is reconciled on agent reconnect. The script changes only rules in group `SentryGate` with SentryGate names/descriptions. It cannot disable Windows Firewall or edit unrelated rules. Dashboard enforcement is off by default, every rule needs a preview and explicit owner approval, and automatic blocking remains disabled.
+- Administrator approval and policy changes are owner-only backend operations, audited with target, evidence, reason, expiry, approver, and resulting OS state. A disconnected device leaves an action pending; after reconnect it reports observed rule state. The agent continues inventory/reporting if the helper is missing or unavailable.
+
+**Safe local demonstration (no Windows API collection or firewall operation)**
+
+In one PowerShell terminal:
+
+```powershell
+npm run dev
+```
+
+On a fresh database, create the first administrator at [http://127.0.0.1:4300](http://127.0.0.1:4300). In another repository-root terminal:
+
+```powershell
+npm run demo:host-security
+```
+
+Open **Devices** and inspect the simulated computer. The fixture shows an application/process owning a listener, installed app/service/startup metadata, a synthetic disabled-Defender checkup finding, and associated alerts. It does not enroll a real device or touch Windows Firewall. On **Firewall**, per-application enforcement should say **Preview only**. A simulated device cannot receive a policy command.
+
+**Review, disable, rollback, and uninstall**
+
+1. Keep the Firewall page's per-application enforcement switch off for observe/preview-only operation. Turning it on requires an owner, a browser confirmation, and a second explicit approval for each temporary policy. Turning it off queues removal of existing SentryGate application rules; leave the agent/helper running until the dashboard reports removal verified.
+2. To stop monitoring without uninstalling (elevated PowerShell):
+
+```powershell
+Stop-Service SentryGateAgent
+```
+
+To stop the optional helper too:
+
+```powershell
+Stop-Service SentryGateFirewallHelper -ErrorAction SilentlyContinue
+```
+
+3. To uninstall (elevated PowerShell, from the repository root), which stops both services and removes only matching SentryGate-owned rules before deleting the services and program files:
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\apps\agent\scripts\uninstall-agent.ps1
+```
+
+To also delete the agent's DPAPI-protected local queue/configuration after uninstall:
+
+```powershell
+.\apps\agent\scripts\uninstall-agent.ps1 -RemoveData
+```
+
+Revoke the device credential in the dashboard separately; uninstall cannot revoke a credential while offline. Never use `-RemoveData` before preserving events needed for investigation. The uninstall script matches only SentryGate's own group, name, and description markers.
+
+The helper is a pilot-stage local service, not a substitute for a Windows security baseline. Review the preview against actual application/access requirements before enabling enforcement. Controls target inbound application traffic only; they do not provide application sandboxing, outbound control, kernel protection, or tamper resistance against a local administrator.
+### Windows installer (Milestone 13)
+
+Build an offline-capable Windows x64 PowerShell/ZIP release on Windows with Node.js 24+:
+
+```powershell
+npm test
+npm run typecheck
+npm run build
+.\scripts\build-release.ps1 -OutputDirectory .\release
+Get-FileHash .\release\SentryGate-0.1.0-Windows-x64.zip -Algorithm SHA256
+```
+
+The generated release contains `INSTALL-WINDOWS.md`, a private Node runtime, the local backend/dashboard/SQLite code, the agent, and lifecycle scripts. No `.env` files or existing database/event data are bundled. For GitHub distribution, tag `v0.1.0`; `.github/workflows/windows-release.yml` tests/packages it and waits for the protected `windows-clean-vm-qualified` environment. Set the environment variable `SENTRYGATE_CLEAN_WINDOWS_VM_VERIFIED=true` and approve only after the exact candidate passes the clean-VM checklist. The attached assets are `SentryGate-0.1.0-Windows-x64.zip` and `SentryGate-0.1.0-Windows-x64.zip.sha256` (plus `RELEASE-CHECKLIST.md`). The root `Install-SentryGate.ps1 -Version v0.1.0` downloads that named release, verifies its checksum, installs, and checks `SentryGateAgent`; for an existing installation use `-Update` to preserve local data. Each fresh computer creates its own database, administrator, device identity, and credential. The default required service is `SentryGateAgent`; `SentryGateFirewallHelper` is optional and remains uninstalled unless separately requested. Observe and preview-only defaults remain in force. See [INSTALL-WINDOWS.md](INSTALL-WINDOWS.md) for exact release, install, health, update, rollback, uninstall, and clean-VM qualification commands.

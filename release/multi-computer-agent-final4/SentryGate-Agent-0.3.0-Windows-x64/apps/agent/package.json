@@ -1,0 +1,6 @@
+{
+  "name": "@sentrygate/windows-agent",
+  "private": true,
+  "version": "0.3.0",
+  "type": "module"
+}

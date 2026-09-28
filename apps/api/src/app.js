@@ -14,8 +14,14 @@ import { actionForDashboard, evaluateIncidentPolicies, expireGatewayActions, val
 import { logOperational } from "./logger.js";
 import { databaseBytes } from "./operations.js";
 import { generatePilotReport, pilotMetrics } from "./pilot.js";
+import { applyAnalysisFeedback, findingForDashboard, readAnalysisSettings } from "./offline-analysis.js";
 
-const cookieName = "sentrygate_session";
+function cookieName(config) {
+  const port = Number(config.port);
+  return Number.isInteger(port) && port > 0 && port <= 65535
+    ? `sentrygate_session_${port}`
+    : "sentrygate_session";
+}
 
 export function createServer(db, config) {
   const loginAttempts=new Map();
@@ -51,9 +57,21 @@ async function route(req, res, db, config, loginAttempts) {
     if (!device || !safeTokenMatches(token, device.credential_hash)) return json(res, 401, { error: "Valid device credential required" });
     expireFirewallRules(db);
     const rules = db.prepare("SELECT * FROM firewall_rules WHERE device_id=? AND status IN ('approved','active','failed','removing','expired')").all(deviceConfig[1]).map(firewallRuleForAgent);
+    const enforcementEnabled = Boolean(db.prepare("SELECT enforcement_enabled FROM firewall_settings WHERE id=1").get().enforcement_enabled);
+    let applicationPolicyCommand = null;
+    {
+      expireApplicationPolicies(db);
+      const policies = db.prepare(`SELECT * FROM application_network_policies WHERE device_id=? AND mode IN ('allow','block') AND status IN (${enforcementEnabled ? "'approved','active','removing','expired','failed'" : "'removing','expired'"})`).all(device.device_id).map(applicationPolicyForAgent);
+      if (policies.length) {
+        const issuedAt = new Date().toISOString(), nonce = crypto.randomUUID(), expiresAt = new Date(Date.now() + 90_000).toISOString();
+        db.prepare("DELETE FROM device_command_nonces WHERE expires_at<?").run(issuedAt);
+        db.prepare("INSERT INTO device_command_nonces(device_id,nonce,expires_at) VALUES(?,?,?)").run(device.device_id, nonce, expiresAt);
+        applicationPolicyCommand = { nonce, issuedAt, expiresAt, policies };
+      }
+    }
     const update = db.prepare("SELECT version,config_json FROM device_config_updates WHERE device_id=? AND status IN ('pending','failed') ORDER BY version DESC LIMIT 1").get(device.device_id);
     if (update) db.prepare("UPDATE device_config_updates SET status='pending',attempts=attempts+1,last_attempt_at=?,detail='' WHERE device_id=? AND version=?").run(new Date().toISOString(), device.device_id, update.version);
-    return json(res, 200, { ...deviceSettingsFor(device), ...(update ? JSON.parse(update.config_json) : {}), configVersion: update?.version ?? device.config_version, firewallRules: rules });
+    return json(res, 200, { ...deviceSettingsFor(device), ...(update ? JSON.parse(update.config_json) : {}), configVersion: update?.version ?? device.config_version, firewallRules: rules, applicationPolicyCommand });
   }
   const configAck = url.pathname.match(/^\/api\/devices\/([0-9a-f-]{36})\/config\/ack$/i);
   if (configAck && req.method === "POST") {
@@ -96,6 +114,14 @@ async function route(req, res, db, config, loginAttempts) {
           db.prepare("UPDATE incidents SET event_count=(SELECT COUNT(*) FROM incident_events WHERE incident_id=?),last_seen=MAX(last_seen,?),updated_at=? WHERE id=?")
             .run(rule.incident_id, stateReceivedAt, stateReceivedAt, rule.incident_id);
         } else if (eventResult.changes) correlateEvent(db, Number(eventResult.lastInsertRowid));
+        if (status === "failed") {
+          const prior = db.prepare("SELECT id FROM alerts WHERE device_id=? AND title='SentryGate-owned firewall rule drift' AND status='open' AND evidence LIKE ? LIMIT 1").get(deviceId, `%${rule.id}%`);
+          if (!prior) db.prepare(`INSERT INTO alerts(asset_id,title,severity,status,evidence,observed_facts,estimate,event_id,device_id,created_at)
+            VALUES(?,?,'high','open',?,?,?,?,?,?)`).run(device.asset_id, "SentryGate-owned firewall rule drift",
+            `Agent helper reported that owned rule ${rule.id} failed or differs from the approved state: ${result.detail}`,
+            `Observed state: ${state}. Expected SentryGate rule ${rule.protocol} inbound ${rule.remote_cidr} port ${rule.local_port}.`,
+            "Only a SentryGate-owned rule was inspected. This report does not imply unrelated firewall rules were changed.", Number(eventResult.lastInsertRowid), deviceId, stateReceivedAt);
+        }
         if (rule.action_id) {
           const actionStatus = status === "removed" ? (rule.expires_at <= stateReceivedAt ? "expired" : "rolled_back") : status === "failed" ? "failed" : status === "active" ? "active" : null;
           if (actionStatus) db.prepare("UPDATE proposed_actions SET status=?,failure=?,updated_at=? WHERE id=?").run(actionStatus, status === "failed" ? result.detail : "", stateReceivedAt, rule.action_id);
@@ -126,9 +152,10 @@ async function route(req, res, db, config, loginAttempts) {
     try {
       db.prepare(`UPDATE device_agents SET hostname=?,os_version=?,agent_version=?,last_heartbeat=?,health_status=?,health_detail=?,backend_addresses=? WHERE device_id=?`)
         .run(body.device.hostname, body.device.osVersion, body.device.agentVersion, receivedAt, body.healthStatus, (body.collectionErrors ?? []).join("; ").slice(0, 1000), JSON.stringify(body.backendAddresses ?? []), deviceId);
-      db.prepare(`INSERT INTO device_snapshots (device_id,captured_at,processes_json,connections_json) VALUES (?,?,?,?)
-        ON CONFLICT(device_id) DO UPDATE SET captured_at=excluded.captured_at,processes_json=excluded.processes_json,connections_json=excluded.connections_json`)
-        .run(deviceId, body.timestamp, JSON.stringify(body.processes), JSON.stringify(body.connections));
+      db.prepare(`INSERT INTO device_snapshots (device_id,captured_at,processes_json,connections_json,applications_json,services_json,startup_entries_json,security_settings_json) VALUES (?,?,?,?,?,?,?,?)
+        ON CONFLICT(device_id) DO UPDATE SET captured_at=excluded.captured_at,processes_json=excluded.processes_json,connections_json=excluded.connections_json,
+        applications_json=excluded.applications_json,services_json=excluded.services_json,startup_entries_json=excluded.startup_entries_json,security_settings_json=excluded.security_settings_json`)
+        .run(deviceId, body.timestamp, JSON.stringify(body.processes), JSON.stringify(body.connections), JSON.stringify(body.installedApplications ?? []), JSON.stringify(body.services ?? []), JSON.stringify(body.startupEntries ?? []), JSON.stringify(body.securitySettings ?? {}));
       for (const item of body.events) {
         const inserted = db.prepare(`INSERT OR IGNORE INTO events (asset_id,source,category,action,reason,evidence,observed_source_ip,
           request_details,process_details,severity,detection_rule,device_id,source_event_id,created_at)
@@ -145,15 +172,26 @@ async function route(req, res, db, config, loginAttempts) {
       const cutoff = new Date(Date.now() - device.retained_days * 86_400_000).toISOString();
       db.prepare("DELETE FROM events WHERE device_id=? AND created_at < ?").run(deviceId, cutoff);
       db.prepare("DELETE FROM alerts WHERE device_id=? AND created_at < ?").run(deviceId, cutoff);
+      if (body.commandAckNonce) {
+        const nonce = db.prepare("SELECT expires_at,consumed_at FROM device_command_nonces WHERE device_id=? AND nonce=?").get(deviceId, body.commandAckNonce);
+        if (!nonce || nonce.expires_at < receivedAt) throw Object.assign(new Error("Device command is expired or unknown"), { statusCode: 400 });
+        if (!nonce.consumed_at) {
+          db.prepare("UPDATE device_command_nonces SET consumed_at=? WHERE device_id=? AND nonce=? AND consumed_at IS NULL").run(receivedAt, deviceId, body.commandAckNonce);
+          recordAudit(db, `device:${deviceId}`, "device.command_acknowledged", `device:${deviceId}`, `Authenticated one-time application policy command acknowledgement ${body.commandAckNonce}.`);
+        }
+      }
       db.exec("COMMIT");
     } catch (error) { db.exec("ROLLBACK"); throw error; }
     return json(res, 200, { acceptedEventIds, settings: deviceSettingsFor(device) });
   }
 
   if (url.pathname === "/api/health" && req.method === "GET") {
+    if(!["127.0.0.1","::1","::ffff:127.0.0.1"].includes(req.socket.remoteAddress)&&!currentAdmin(req,db,config))return json(res,401,{error:"Authentication required"});
     db.prepare("SELECT 1 AS ready").get();
     const bytes=databaseBytes(config.dbPath);
-    return json(res, bytes<config.maxDbBytes?200:503, { ok: bytes<config.maxDbBytes, service: "sentrygate-api", database: "ready", storageBytes: bytes, storageLimitBytes: config.maxDbBytes, transport: config.tlsCertPath?"https":"loopback-http-development" });
+    const storage=storageStatus(config,bytes);
+    const gatewayOutbox=db.prepare("SELECT COUNT(*) AS pending,COALESCE(SUM(length(event_json)),0) AS queuedBytes FROM gateway_event_outbox").get();
+    return json(res, bytes<config.maxDbBytes?200:503, { ok: bytes<config.maxDbBytes, service: "sentrygate-api", database: "ready", gatewayOutbox, ...storage, transport: config.tlsCertPath?"https":"loopback-http-development", remoteAccessEnabled:config.remoteAccessEnabled, standalone:Boolean(config.standalone) });
   }
 
   if (url.pathname === "/api/session" && req.method === "GET") {
@@ -255,6 +293,34 @@ async function route(req, res, db, config, loginAttempts) {
     return json(res, inserted.changes ? 201 : 200, { accepted: true, duplicate: !inserted.changes });
   }
 
+  const applicationPolicyState = url.pathname.match(/^\/api\/devices\/([0-9a-f-]{36})\/application-policy-state$/i);
+  if (applicationPolicyState && req.method === "POST") {
+    const deviceId = applicationPolicyState[1], token = /^Bearer\s+(.+)$/i.exec(req.headers.authorization ?? "")?.[1] ?? "";
+    const device = db.prepare("SELECT * FROM device_agents WHERE device_id=? AND revoked_at IS NULL AND is_demo=0").get(deviceId);
+    if (!device || !safeTokenMatches(token, device.credential_hash)) return json(res, 401, { error: "Valid device credential required" });
+    const body = await readJson(req);
+    if (!Array.isArray(body.results) || body.results.length > 100 || body.results.some((r) => typeof r.id !== "string" || !["active", "removed", "failed"].includes(r.status) || typeof r.detail !== "string" || r.detail.length > 1000)) return json(res, 400, { error: "Invalid application policy state report" });
+    for (const result of body.results) {
+      const policy = db.prepare("SELECT * FROM application_network_policies WHERE id=? AND device_id=?").get(result.id, deviceId);
+      if (!policy) continue;
+      const status = result.status === "active" && policy.status === "removing" ? "removing" : result.status;
+      const actualState = JSON.stringify(result.actualState ?? null);
+      const stateChanged = policy.status !== status || (policy.actual_state ?? "null") !== actualState || (policy.failure ?? "") !== (status === "failed" ? result.detail : "");
+      if (!stateChanged) continue;
+      db.prepare("UPDATE application_network_policies SET status=?,actual_state=?,failure=?,updated_at=? WHERE id=?").run(status, actualState, status === "failed" ? result.detail : "", new Date().toISOString(), policy.id);
+      if (["failed", "active", "removed"].includes(status)) recordAudit(db, `device:${deviceId}`, `firewall.application_policy_${status}`, `application-policy:${policy.id}`, `${result.detail || status}; observed state ${JSON.stringify(result.actualState ?? null).slice(0, 800)}.`);
+      if (status === "failed") {
+        const eventId = crypto.randomUUID(), createdAt = new Date().toISOString();
+        db.prepare(`INSERT INTO events(asset_id,source,category,action,reason,evidence,process_details,severity,detection_rule,device_id,source_event_id,created_at)
+          VALUES(?,'windows-firewall','application-policy','observed',?,?,?,?,?,?,?,?)`).run(device.asset_id, result.detail, actualState, policy.program_path, "high", "sentrygate_application_rule_changed", deviceId, `app-policy-state:${policy.id}:${createdAt}`, createdAt);
+        const prior = db.prepare("SELECT 1 FROM alerts WHERE device_id=? AND title='SentryGate application firewall rule changed' AND status='open' AND evidence LIKE ? LIMIT 1").get(deviceId, `%${policy.id}%`);
+        if (!prior) db.prepare(`INSERT INTO alerts(asset_id,title,severity,status,evidence,observed_facts,estimate,device_id,created_at)
+          VALUES(?,'SentryGate application firewall rule changed','high','open',?,?,?,?,?)`).run(device.asset_id, `${result.detail} Policy ${policy.id}.`, "The SentryGate firewall helper reported a drift or failed operation for a SentryGate-owned rule.", "Actual firewall state requires administrator review; unrelated firewall rules were not changed.", deviceId, createdAt);
+      }
+    }
+    return json(res, 200, { accepted: true });
+  }
+
   const admin = url.pathname.startsWith("/api/") ? currentAdmin(req, db, config) : null;
   if (url.pathname.startsWith("/api/") && !admin) {
     return json(res, 401, { error: "Authentication required" });
@@ -264,24 +330,135 @@ async function route(req, res, db, config, loginAttempts) {
     if(origin){try{if(!sameRequestOrigin(origin,req))return json(res,403,{error:"Cross-origin administrator request rejected"});}catch{return json(res,403,{error:"Invalid request origin"});}}
   }
   if (url.pathname.startsWith("/api/") && admin.role !== "owner") {
-    const analystWrite = admin.role === "security_analyst" && ((req.method === "POST" && /^\/api\/incidents\/[a-f0-9-]+\/notes$/.test(url.pathname)) || (req.method === "PATCH" && /^\/api\/incidents\/[a-f0-9-]+\/status$/.test(url.pathname)) || (req.method === "POST" && url.pathname === "/api/action-policies") || (req.method === "POST" && /^\/api\/events\/\d+\/false-positive$/.test(url.pathname)));
+    const analystWrite = admin.role === "security_analyst" && ((req.method === "POST" && /^\/api\/incidents\/[a-f0-9-]+\/notes$/.test(url.pathname)) || (req.method === "PATCH" && /^\/api\/incidents\/[a-f0-9-]+\/status$/.test(url.pathname)) || (req.method === "POST" && url.pathname === "/api/action-policies") || (req.method === "POST" && /^\/api\/events\/\d+\/false-positive$/.test(url.pathname)) || (req.method === "POST" && /^\/api\/analysis\/findings\/[a-f0-9-]+\/feedback$/i.test(url.pathname)));
     if (!(["GET", "HEAD"].includes(req.method)) && !analystWrite) return json(res, 403, { error: "This administrator role cannot perform that action" });
   }
 
+  if (url.pathname === "/api/storage" && req.method === "GET") {
+    const bytes=databaseBytes(config.dbPath);
+    return json(res,200,{...storageStatus(config,bytes),remoteAccessEnabled:config.remoteAccessEnabled});
+  }
+
+  if (url.pathname === "/api/firewall/enforcement" && req.method === "GET") {
+    const setting = db.prepare("SELECT enforcement_enabled AS enabled,updated_at AS updatedAt FROM firewall_settings WHERE id=1").get();
+    return json(res, 200, { ...setting, enabled: Boolean(setting.enabled), automaticBlockingEnabled: false });
+  }
+  if (url.pathname === "/api/firewall/enforcement" && req.method === "PUT") {
+    const body = await readJson(req);
+    if (typeof body.enabled !== "boolean" || body.enabled && body.confirmed !== true) return json(res, 400, { error: "An explicit confirmed boolean is required to change application policy enforcement" });
+    const now = new Date().toISOString();
+    db.prepare("UPDATE firewall_settings SET enforcement_enabled=?,updated_at=? WHERE id=1").run(Number(body.enabled), now);
+    if (!body.enabled) db.prepare("UPDATE application_network_policies SET status='removing',rollback_at=?,updated_at=? WHERE status IN ('approved','active','failed') AND mode IN ('allow','block')").run(now, now);
+    recordAudit(db, admin.email, body.enabled ? "firewall.application_enforcement_enabled" : "firewall.application_enforcement_disabled", "firewall:application-enforcement", body.enabled ? "Enabled explicitly approved per-application policies; automatic blocking remains disabled." : "Disabled application policy enforcement and queued removal of all active SentryGate application rules.");
+    return json(res, 200, { enabled: body.enabled, updatedAt: now });
+  }
+  if (url.pathname === "/api/application-policies" && req.method === "GET") {
+    expireApplicationPolicies(db);
+    return json(res, 200, db.prepare(`SELECT p.*,d.name AS device_name FROM application_network_policies p JOIN device_agents d USING(device_id)
+      ORDER BY CASE p.status WHEN 'proposed' THEN 0 WHEN 'failed' THEN 1 ELSE 2 END,p.created_at DESC LIMIT 500`).all().map(applicationPolicyForDashboard));
+  }
+  if (url.pathname === "/api/application-policies/preview" && req.method === "POST") {
+    const body = await readJson(req), invalid = validateApplicationPolicy(body, db);
+    if (invalid) return json(res, 400, { error: invalid });
+    const existing = db.prepare("SELECT * FROM application_network_policies WHERE idempotency_key=?").get(body.idempotencyKey);
+    if (existing) {
+      if (existing.device_id !== body.deviceId || existing.program_path.toLowerCase() !== body.programPath.toLowerCase() || existing.mode !== body.mode || existing.expires_at !== body.expiresAt || existing.reason !== body.reason.trim() || existing.evidence !== body.evidence.trim()) return json(res, 409, { error: "Idempotency key was already used for a different application policy" });
+      return json(res, 200, { policy: applicationPolicyForDashboard(existing), preview: JSON.parse(existing.preview_json) });
+    }
+    const device = db.prepare("SELECT device_id,is_demo FROM device_agents WHERE device_id=? AND revoked_at IS NULL").get(body.deviceId);
+    if (!device || device.is_demo) return json(res, 404, { error: "A non-demo enrolled device is required" });
+    const snapshot = db.prepare("SELECT processes_json FROM device_snapshots WHERE device_id=?").get(body.deviceId);
+    const observed = snapshot ? JSON.parse(snapshot.processes_json).find((process) => typeof process.executablePath === "string" && process.executablePath.toLowerCase() === body.programPath.toLowerCase()) : null;
+    if (!observed) return json(res, 400, { error: "Select an executable path observed in this device's latest process inventory" });
+    const preview = { deviceId: body.deviceId, applicationName: body.applicationName.trim(), programPath: observed.executablePath, mode: body.mode,
+      expectedEffect: body.mode === "review" ? "Record a reviewed policy without changing Windows Firewall." : `${body.mode === "block" ? "Block" : "Allow"} inbound network access for this executable only.`,
+      expiresAt: body.expiresAt, reason: body.reason.trim(), evidence: body.evidence.trim(), firewallChange: body.mode !== "review", requiresEnforcementEnabled: body.mode !== "review" };
+    const id = crypto.randomUUID(), now = new Date().toISOString();
+    db.prepare(`INSERT INTO application_network_policies(id,device_id,application_name,program_path,mode,reason,evidence,expires_at,status,idempotency_key,preview_json,created_by,created_at,updated_at)
+      VALUES(?,?,?,?,?,?,?,?, 'proposed',?,?,?,?,?)`).run(id, body.deviceId, body.applicationName.trim(), observed.executablePath, body.mode, body.reason.trim(), body.evidence.trim(), body.expiresAt, body.idempotencyKey, JSON.stringify(preview), admin.email, now, now);
+    recordAudit(db, admin.email, "firewall.application_policy_previewed", `application-policy:${id}`, `Previewed ${body.mode} policy for ${body.applicationName.trim()} on device ${body.deviceId}; no firewall changes were made.`);
+    return json(res, 201, { policy: applicationPolicyForDashboard(db.prepare("SELECT * FROM application_network_policies WHERE id=?").get(id)), preview });
+  }
+  const appPolicyAction = url.pathname.match(/^\/api\/application-policies\/([a-f0-9-]{36})\/(approve|rollback)$/i);
+  if (appPolicyAction && req.method === "POST") {
+    const [, id, action] = appPolicyAction, body = await readJson(req);
+    const policy = db.prepare("SELECT * FROM application_network_policies WHERE id=?").get(id);
+    if (!policy) return json(res, 404, { error: "Application policy not found" });
+    if (body.confirmed !== true) return json(res, 400, { error: "Explicit administrator confirmation is required" });
+    const now = new Date().toISOString();
+    if (action === "approve") {
+      if (policy.status === "approved" || policy.status === "active") return json(res, 200, applicationPolicyForDashboard(policy));
+      if (policy.status !== "proposed" || policy.expires_at <= now) return json(res, 409, { error: "Only an unexpired proposed policy can be approved" });
+      if (policy.mode !== "review" && !db.prepare("SELECT enforcement_enabled FROM firewall_settings WHERE id=1").get().enforcement_enabled) return json(res, 409, { error: "Application policy enforcement is preview-only. An owner must explicitly enable it first." });
+      const status = policy.mode === "review" ? "review" : "approved";
+      db.prepare("UPDATE application_network_policies SET status=?,approved_by=?,approved_at=?,updated_at=? WHERE id=?").run(status, admin.email, now, now, id);
+      recordAudit(db, admin.email, "firewall.application_policy_approved", `application-policy:${id}`, `Approved ${policy.mode} policy for ${policy.application_name} on ${policy.device_id}; ${policy.mode === "review" ? "no firewall operation" : "authenticated device helper sync pending"}.`);
+    } else {
+      if (["removed", "review", "proposed"].includes(policy.status)) return json(res, 200, applicationPolicyForDashboard(policy));
+      db.prepare("UPDATE application_network_policies SET status='removing',rollback_at=?,updated_at=? WHERE id=?").run(now, now, id);
+      recordAudit(db, admin.email, "firewall.application_policy_rollback_requested", `application-policy:${id}`, `Queued removal of SentryGate-owned policy ${id}; removal confirmation depends on the enrolled agent helper.`);
+    }
+    return json(res, 200, applicationPolicyForDashboard(db.prepare("SELECT * FROM application_network_policies WHERE id=?").get(id)));
+  }
+  if (url.pathname === "/api/analysis/settings" && req.method === "GET") {
+    const settings = readAnalysisSettings(db);
+    const state = db.prepare("SELECT cursor_event_id AS cursorEventId,last_run_at AS lastRunAt,last_error AS lastError,processed_total AS processedTotal FROM local_analysis_state WHERE id=1").get();
+    const findings = db.prepare("SELECT COUNT(*) AS count FROM local_analysis_findings").get().count;
+    return json(res, 200, { settings, state, findings });
+  }
+  if (url.pathname === "/api/analysis/settings" && req.method === "PUT") {
+    const body = await readJson(req);
+    if (typeof body.enabled !== "boolean" || !Number.isInteger(body.batchSize) || body.batchSize < 1 || body.batchSize > 500 || !Number.isInteger(body.pollIntervalMs) || body.pollIntervalMs < 250 || body.pollIntervalMs > 60000 || !Number.isInteger(body.findingRetainedDays) || body.findingRetainedDays < 1 || body.findingRetainedDays > 3650 || !Number.isInteger(body.sensitiveThreshold) || body.sensitiveThreshold < 2 || body.sensitiveThreshold > 100 || !Number.isInteger(body.sensitiveWindowMinutes) || body.sensitiveWindowMinutes < 1 || body.sensitiveWindowMinutes > 1440 || !Number.isInteger(body.requestRateThreshold) || body.requestRateThreshold < 5 || body.requestRateThreshold > 100000 || !Number.isInteger(body.requestWindowSeconds) || body.requestWindowSeconds < 10 || body.requestWindowSeconds > 3600 || !Number.isInteger(body.baselineDays) || body.baselineDays < 1 || body.baselineDays > 90 || !Number.isFinite(body.rateSigma) || body.rateSigma < 1 || body.rateSigma > 10 || !Number.isInteger(body.connectionThreshold) || body.connectionThreshold < 5 || body.connectionThreshold > 100000) return json(res, 400, { error: "Invalid analysis settings; values must be within the displayed bounds" });
+    const now = new Date().toISOString();
+    db.prepare(`UPDATE local_analysis_settings SET enabled=?,batch_size=?,poll_interval_ms=?,finding_retained_days=?,sensitive_threshold=?,sensitive_window_minutes=?,request_rate_threshold=?,request_window_seconds=?,baseline_days=?,rate_sigma=?,connection_threshold=?,updated_at=? WHERE id=1`)
+      .run(Number(body.enabled), body.batchSize, body.pollIntervalMs, body.findingRetainedDays, body.sensitiveThreshold, body.sensitiveWindowMinutes, body.requestRateThreshold, body.requestWindowSeconds, body.baselineDays, body.rateSigma, body.connectionThreshold, now);
+    recordAudit(db, admin.email, "analysis.settings_updated", "offline-analysis", `Analysis ${body.enabled ? "enabled" : "disabled"}; batch ${body.batchSize}; retention ${body.findingRetainedDays} days; thresholds sensitive=${body.sensitiveThreshold}, request=${body.requestRateThreshold}, connections=${body.connectionThreshold}.`);
+    return json(res, 200, { saved: true });
+  }
+  if (url.pathname === "/api/analysis/findings" && req.method === "GET") {
+    const category = url.searchParams.get("category"), feedback = url.searchParams.get("feedback"), severity = url.searchParams.get("severity");
+    const clauses = [], values = [];
+    if (category && ["sensitive_path", "request_rate", "connection_pattern"].includes(category)) { clauses.push("category=?"); values.push(category); }
+    if (feedback && ["useful", "false_positive", "unreviewed"].includes(feedback)) { clauses.push(feedback === "unreviewed" ? "feedback IS NULL" : "feedback=?"); if (feedback !== "unreviewed") values.push(feedback); }
+    if (severity && ["low", "medium", "high"].includes(severity)) { clauses.push("severity=?"); values.push(severity); }
+    if (url.searchParams.has("assetId") && /^\d+$/.test(url.searchParams.get("assetId"))) { clauses.push("asset_id=?"); values.push(Number(url.searchParams.get("assetId"))); }
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    const rows = db.prepare(`SELECT * FROM local_analysis_findings ${where} ORDER BY created_at DESC LIMIT 200`).all(...values);
+    return json(res, 200, rows.map(findingForDashboard));
+  }
+  const findingFeedback = url.pathname.match(/^\/api\/analysis\/findings\/([a-f0-9-]{36})\/feedback$/i);
+  if (findingFeedback && req.method === "POST") {
+    const body = await readJson(req);
+    if (!["useful", "false_positive"].includes(body.feedback)) return json(res, 400, { error: "feedback must be useful or false_positive" });
+    const finding = db.prepare("SELECT id,category FROM local_analysis_findings WHERE id=?").get(findingFeedback[1]);
+    if (!finding) return json(res, 404, { error: "Analysis finding not found" });
+    const now = new Date().toISOString();
+    db.prepare("UPDATE local_analysis_findings SET feedback=?,reviewed_by=?,reviewed_at=? WHERE id=?").run(body.feedback, admin.email, now, finding.id);
+    const tuning = applyAnalysisFeedback(db, finding.category, now);
+    recordAudit(db, admin.email, "analysis.feedback_recorded", `analysis-finding:${finding.id}`, `Marked ${finding.category} finding ${body.feedback}; effective threshold multiplier ${tuning.multiplier} from ${tuning.useful} useful and ${tuning.falsePositive} false-positive reviews.`);
+    return json(res, 200, { findingId: finding.id, feedback: body.feedback, tuning });
+  }
+
   if (url.pathname === "/api/actions/settings" && req.method === "GET") {
-    const setting = db.prepare("SELECT emergency_paused AS emergencyPaused,updated_at AS updatedAt FROM action_settings WHERE id=1").get();
-    return json(res, 200, { ...setting, automaticBlockingEnabled: false });
+    const setting = db.prepare("SELECT emergency_paused AS emergencyPaused,enforce_enabled AS enforcementEnabled,max_active_blocks AS maxActiveBlocks,updated_at AS updatedAt FROM action_settings WHERE id=1").get();
+    return json(res, 200, { ...setting, automaticBlockingEnabled: Boolean(setting.enforcementEnabled) });
   }
   if (url.pathname === "/api/actions/settings" && req.method === "PUT") {
     const body = await readJson(req);
-    if (typeof body.emergencyPaused !== "boolean") return json(res, 400, { error: "emergencyPaused must be a boolean" });
+    if (body.emergencyPaused !== undefined && typeof body.emergencyPaused !== "boolean") return json(res, 400, { error: "emergencyPaused must be a boolean" });
+    if (body.enforcementEnabled !== undefined && (typeof body.enforcementEnabled !== "boolean" || body.confirmed !== true)) return json(res, 400, { error: "Changing Enforce requires a boolean value and explicit confirmation" });
+    if (body.maxActiveBlocks !== undefined && (!Number.isInteger(body.maxActiveBlocks) || body.maxActiveBlocks < 1 || body.maxActiveBlocks > 50)) return json(res, 400, { error: "maxActiveBlocks must be from 1 to 50" });
     const now = new Date().toISOString();
-    db.prepare("UPDATE action_settings SET emergency_paused=?,updated_at=? WHERE id=1").run(Number(body.emergencyPaused), now);
-    recordAudit(db, admin.email, body.emergencyPaused ? "action.emergency_paused" : "action.emergency_resumed", "actions:settings", body.emergencyPaused ? "Paused future action proposals and approvals; existing rules were not changed." : "Resumed future suggestion evaluation; automatic blocking remains disabled.");
-    if (!body.emergencyPaused) {
+    const old = db.prepare("SELECT emergency_paused,enforce_enabled,max_active_blocks FROM action_settings WHERE id=1").get();
+    const emergencyPaused = body.emergencyPaused ?? Boolean(old.emergency_paused), enforcementEnabled = body.enforcementEnabled ?? Boolean(old.enforce_enabled), maxActiveBlocks = body.maxActiveBlocks ?? old.max_active_blocks;
+    db.prepare("UPDATE action_settings SET emergency_paused=?,enforce_enabled=?,max_active_blocks=?,updated_at=? WHERE id=1").run(Number(emergencyPaused), Number(enforcementEnabled), maxActiveBlocks, now);
+    if (body.emergencyPaused !== undefined) recordAudit(db, admin.email, body.emergencyPaused ? "action.emergency_paused" : "action.emergency_resumed", "actions:settings", body.emergencyPaused ? "Paused future proposals and automatic policy actions; existing temporary rules were not changed." : "Resumed policy evaluation.");
+    if (body.enforcementEnabled !== undefined && enforcementEnabled !== Boolean(old.enforce_enabled)) recordAudit(db, admin.email, enforcementEnabled ? "action.enforce_enabled" : "action.enforce_disabled", "actions:settings", `${enforcementEnabled ? "Enabled" : "Disabled"} automatic actions only for individually enabled Enforce policies. Existing temporary rules were not changed.`);
+    if (body.maxActiveBlocks !== undefined && maxActiveBlocks !== old.max_active_blocks) recordAudit(db, admin.email, "action.block_limit_updated", "actions:settings", `Changed global active temporary block limit from ${old.max_active_blocks} to ${maxActiveBlocks}.`);
+    if (!emergencyPaused) {
       for (const incident of db.prepare("SELECT id FROM incidents WHERE status IN ('open','investigating')").all()) evaluateIncidentPolicies(db, incident.id);
     }
-    return json(res, 200, { emergencyPaused: body.emergencyPaused, automaticBlockingEnabled: false, updatedAt: now });
+    return json(res, 200, { emergencyPaused, enforcementEnabled, maxActiveBlocks, automaticBlockingEnabled: enforcementEnabled, updatedAt: now });
   }
   if (url.pathname === "/api/action-policies" && req.method === "GET") {
     return json(res, 200, db.prepare("SELECT p.*,a.name AS asset_name FROM action_policies p JOIN assets a ON a.id=p.asset_id ORDER BY p.created_at DESC").all().map(actionPolicyForDashboard));
@@ -290,9 +467,11 @@ async function route(req, res, db, config, loginAttempts) {
     const body = await readJson(req), invalid = validateActionPolicy(body, db);
     if (invalid) return json(res, 400, { error: invalid });
     const id = crypto.randomUUID(), now = new Date().toISOString();
+    const mode = body.mode ?? "observe";
+    if (mode === "enforce" && admin.role !== "owner") return json(res, 403, { error: "Only an owner can create an Enforce policy" });
     db.prepare(`INSERT INTO action_policies (id,name,enabled,mode,asset_id,detection_rule,minimum_severity,minimum_event_count,window_minutes,target_type,target_id,protocol,local_port,duration_minutes,created_by,created_at,updated_at)
-      VALUES (?,?,1,'suggestion-only',?,?,?,?,?,?,?,?,?,?,?, ?,?)`).run(id, body.name.trim(), body.assetId, body.detectionRule || "*", body.minimumSeverity, body.minimumEventCount, body.windowMinutes, body.targetType, String(body.targetId), body.targetType === "device" ? body.protocol : "TCP", body.targetType === "device" ? body.localPort : 443, body.durationMinutes, admin.email, now, now);
-    recordAudit(db, admin.email, "action.policy_created", `policy:${id}`, `Created suggestion-only policy ${body.name.trim()} for asset ${body.assetId}; automatic blocking disabled.`);
+      VALUES (?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, body.name.trim(), mode, body.assetId, body.detectionRule || "*", body.minimumSeverity, body.minimumEventCount, body.windowMinutes, body.targetType, String(body.targetId), body.targetType === "device" ? body.protocol : "TCP", body.targetType === "device" ? body.localPort : 443, body.durationMinutes, admin.email, now, now);
+    recordAudit(db, admin.email, "action.policy_created", `policy:${id}`, `Created ${mode} policy ${body.name.trim()} for asset ${body.assetId}; global Enforce remains independently controlled.`);
     const incidents = db.prepare("SELECT id FROM incidents WHERE asset_id=? AND status IN ('open','investigating')").all(body.assetId);
     for (const incident of incidents) evaluateIncidentPolicies(db, incident.id);
     return json(res, 201, actionPolicyForDashboard(db.prepare("SELECT p.*,a.name AS asset_name FROM action_policies p JOIN assets a ON a.id=p.asset_id WHERE p.id=?").get(id)));
@@ -301,10 +480,33 @@ async function route(req, res, db, config, loginAttempts) {
   if (policyMatch && req.method === "PATCH") {
     const body = await readJson(req), policy = db.prepare("SELECT * FROM action_policies WHERE id=?").get(policyMatch[1]);
     if (!policy) return json(res, 404, { error: "Action policy not found" });
-    if (typeof body.enabled !== "boolean") return json(res, 400, { error: "enabled must be a boolean" });
+    if (body.enabled !== undefined && typeof body.enabled !== "boolean") return json(res, 400, { error: "enabled must be a boolean" });
+    if (body.mode !== undefined && !["observe", "recommend", "enforce"].includes(body.mode)) return json(res, 400, { error: "mode must be observe, recommend, or enforce" });
+    if (body.mode === "enforce" && admin.role !== "owner") return json(res, 403, { error: "Only an owner can configure an Enforce policy" });
+    if (body.enabled === undefined && body.mode === undefined) return json(res, 400, { error: "Provide enabled or mode" });
     const now = new Date().toISOString();
-    db.prepare("UPDATE action_policies SET enabled=?,updated_at=? WHERE id=?").run(Number(body.enabled), now, policy.id);
-    recordAudit(db, admin.email, "action.policy_toggled", `policy:${policy.id}`, `${body.enabled ? "Enabled" : "Disabled"} suggestion-only policy ${policy.name}.`);
+    const enabled = body.enabled ?? Boolean(policy.enabled), mode = body.mode ?? policy.mode;
+    db.prepare("INSERT INTO action_policy_history(policy_id,actor,previous_json,changed_at) VALUES(?,?,?,?)")
+      .run(policy.id, admin.email, JSON.stringify({ enabled: Boolean(policy.enabled), mode: policy.mode }), now);
+    db.prepare("UPDATE action_policies SET enabled=?,mode=?,updated_at=? WHERE id=?").run(Number(enabled), mode, now, policy.id);
+    recordAudit(db, admin.email, "action.policy_updated", `policy:${policy.id}`, `Updated ${policy.name}: ${policy.mode} → ${mode}; enabled ${enabled}. Previous policy state remains in audit history.`);
+    if (enabled && mode !== "observe") for (const incident of db.prepare("SELECT id FROM incidents WHERE asset_id=? AND status IN ('open','investigating')").all(policy.asset_id)) evaluateIncidentPolicies(db, incident.id);
+    return json(res, 200, actionPolicyForDashboard(db.prepare("SELECT p.*,a.name AS asset_name FROM action_policies p JOIN assets a ON a.id=p.asset_id WHERE p.id=?").get(policy.id)));
+  }
+  const restorePolicy = url.pathname.match(/^\/api\/action-policies\/([0-9a-f-]{36})\/restore$/i);
+  if (restorePolicy && req.method === "POST") {
+    if (admin.role !== "owner") return json(res, 403, { error: "Only an owner can restore policy settings" });
+    const policy = db.prepare("SELECT * FROM action_policies WHERE id=?").get(restorePolicy[1]);
+    if (!policy) return json(res, 404, { error: "Action policy not found" });
+    const previous = db.prepare("SELECT id,previous_json FROM action_policy_history WHERE policy_id=? ORDER BY id DESC LIMIT 1").get(policy.id);
+    if (!previous) return json(res, 409, { error: "No prior policy version is available to restore" });
+    const prior = JSON.parse(previous.previous_json), now = new Date().toISOString();
+    db.prepare("INSERT INTO action_policy_history(policy_id,actor,previous_json,changed_at) VALUES(?,?,?,?)")
+      .run(policy.id, admin.email, JSON.stringify({ enabled: Boolean(policy.enabled), mode: policy.mode }), now);
+    db.prepare("UPDATE action_policies SET enabled=?,mode=?,updated_at=? WHERE id=?").run(Number(prior.enabled), prior.mode, now, policy.id);
+    db.prepare("DELETE FROM action_policy_history WHERE id=?").run(previous.id);
+    recordAudit(db, admin.email, "action.policy_restored", `policy:${policy.id}`, `Restored previous ${prior.mode} policy state (enabled=${prior.enabled}) for ${policy.name}.`);
+    if (prior.enabled && prior.mode !== "observe") for (const incident of db.prepare("SELECT id FROM incidents WHERE asset_id=? AND status IN ('open','investigating')").all(policy.asset_id)) evaluateIncidentPolicies(db, incident.id);
     return json(res, 200, actionPolicyForDashboard(db.prepare("SELECT p.*,a.name AS asset_name FROM action_policies p JOIN assets a ON a.id=p.asset_id WHERE p.id=?").get(policy.id)));
   }
   if (url.pathname === "/api/actions" && req.method === "GET") {
@@ -541,6 +743,7 @@ async function route(req, res, db, config, loginAttempts) {
   }
 
   if (url.pathname === "/api/devices/enroll" && req.method === "POST") {
+    if (config.standalone && db.prepare("SELECT 1 FROM device_agents WHERE is_demo=0 AND revoked_at IS NULL LIMIT 1").get()) return json(res, 409, { error: "Standalone mode permits one active local Windows agent identity. Do not use this installation to enroll another computer." });
     const body = await readJson(req);
     const invalid = validateDeviceEnrollment(body);
     if (invalid) return json(res, 400, { error: invalid });
@@ -570,10 +773,17 @@ async function route(req, res, db, config, loginAttempts) {
       WHEN last_heartbeat IS NULL OR datetime(last_heartbeat) < datetime('now', '-' || (collection_interval_seconds * 3) || ' seconds') THEN 'stale'
       ELSE health_status END AS healthStatus,revoked_at AS revokedAt,
       health_detail AS healthDetail,
-      collection_processes AS collectionProcesses,collection_connections AS collectionConnections,
+      collection_processes AS collectionProcesses,collection_connections AS collectionConnections,collection_applications AS collectionApplications,
+      collection_services AS collectionServices,collection_startup AS collectionStartup,collection_security AS collectionSecurity,
       collection_interval_seconds AS collectionIntervalSeconds,outbound_connection_threshold AS outboundConnectionThreshold,
-      retained_days AS retainedDays,is_demo AS isDemo,(SELECT status FROM device_config_updates q WHERE q.device_id=device_agents.device_id ORDER BY version DESC LIMIT 1) AS configStatus,
-      (SELECT attempts FROM device_config_updates q WHERE q.device_id=device_agents.device_id ORDER BY version DESC LIMIT 1) AS configAttempts FROM device_agents ORDER BY name`).all();
+      retained_days AS retainedDays,is_demo AS isDemo,config_version AS policyVersion,
+      (SELECT COUNT(*) FROM alerts al WHERE al.device_id=device_agents.device_id AND al.status='open') AS openAlertCount,
+      (SELECT status FROM device_config_updates q WHERE q.device_id=device_agents.device_id ORDER BY version DESC LIMIT 1) AS configStatus,
+      (SELECT attempts FROM device_config_updates q WHERE q.device_id=device_agents.device_id ORDER BY version DESC LIMIT 1) AS configAttempts FROM device_agents ORDER BY name`).all().map((device) => {
+        const snapshot = db.prepare("SELECT services_json FROM device_snapshots WHERE device_id=?").get(device.deviceId);
+        const service = snapshot ? JSON.parse(snapshot.services_json).find((item) => String(item.name).toLowerCase() === "sentrygateagent") : null;
+        return { ...device, agentServiceState: service?.state ?? "Not reported", agentServiceStartMode: service?.startMode ?? "Unknown" };
+      });
     return json(res, 200, devices);
   }
 
@@ -584,9 +794,9 @@ async function route(req, res, db, config, loginAttempts) {
     const invalid = validateDeviceSettings(body);
     if (invalid) return json(res, 400, { error: invalid });
     if (!db.prepare("SELECT 1 FROM device_agents WHERE device_id=?").get(id)) return json(res, 404, { error: "Device not found" });
-    db.prepare(`UPDATE device_agents SET collection_processes=?,collection_connections=?,collection_interval_seconds=?,config_version=config_version+1,
+    db.prepare(`UPDATE device_agents SET collection_processes=?,collection_connections=?,collection_applications=?,collection_services=?,collection_startup=?,collection_security=?,collection_interval_seconds=?,config_version=config_version+1,
       outbound_connection_threshold=?,retained_days=? WHERE device_id=?`)
-      .run(+body.collectProcesses, +body.collectConnections, body.intervalSeconds, body.outboundConnectionThreshold, body.retainedDays, id);
+      .run(+body.collectProcesses, +body.collectConnections, +(body.collectApplications ?? true), +(body.collectServices ?? true), +(body.collectStartup ?? true), +(body.collectSecurity ?? true), body.intervalSeconds, body.outboundConnectionThreshold, body.retainedDays, id);
     queueDeviceConfig(db, db.prepare("SELECT * FROM device_agents WHERE device_id=?").get(id), new Date().toISOString());
     recordAudit(db, admin.email, "device.settings_updated", `device:${id}`, "Updated collection and retention settings.");
     return json(res, 200, { saved: true });
@@ -614,16 +824,21 @@ async function route(req, res, db, config, loginAttempts) {
       enrolled_at AS enrolledAt,last_heartbeat AS lastHeartbeat,CASE WHEN revoked_at IS NOT NULL THEN 'revoked'
       WHEN last_heartbeat IS NULL OR datetime(last_heartbeat) < datetime('now', '-' || (collection_interval_seconds * 3) || ' seconds') THEN 'offline'
       ELSE health_status END AS healthStatus,health_detail AS healthDetail,revoked_at AS revokedAt,is_demo AS isDemo,
-      collection_processes AS collectionProcesses,collection_connections AS collectionConnections,collection_interval_seconds AS collectionIntervalSeconds,
+      collection_processes AS collectionProcesses,collection_connections AS collectionConnections,collection_applications AS collectionApplications,
+      collection_services AS collectionServices,collection_startup AS collectionStartup,collection_security AS collectionSecurity,collection_interval_seconds AS collectionIntervalSeconds,
+      config_version AS policyVersion,(SELECT COUNT(*) FROM alerts al WHERE al.device_id=device_agents.device_id AND al.status='open') AS openAlertCount,
       outbound_connection_threshold AS outboundConnectionThreshold,retained_days AS retainedDays
       FROM device_agents WHERE device_id=?`).get(deviceDetail[1]);
     if (!device) return json(res, 404, { error: "Device not found" });
-    const snapshot = db.prepare("SELECT captured_at AS capturedAt,processes_json AS processes,connections_json AS connections FROM device_snapshots WHERE device_id=?").get(device.deviceId);
-    return json(res, 200, { ...device, processes: snapshot ? JSON.parse(snapshot.processes) : [], connections: snapshot ? JSON.parse(snapshot.connections) : [] });
+    const snapshot = db.prepare("SELECT captured_at AS capturedAt,processes_json AS processes,connections_json AS connections,applications_json AS installedApplications,services_json AS services,startup_entries_json AS startupEntries,security_settings_json AS securitySettings FROM device_snapshots WHERE device_id=?").get(device.deviceId);
+    const services = snapshot ? JSON.parse(snapshot.services) : [];
+    const agentService = services.find((item) => String(item.name).toLowerCase() === "sentrygateagent") ?? null;
+    const recentAlerts = db.prepare("SELECT id,title,severity,status,evidence,created_at AS createdAt FROM alerts WHERE device_id=? ORDER BY created_at DESC LIMIT 50").all(device.deviceId);
+    return json(res, 200, { ...device, recentAlerts, agentServiceState: agentService?.state ?? "Not reported", agentServiceStartMode: agentService?.startMode ?? "Unknown", capturedAt: snapshot?.capturedAt ?? null, processes: snapshot ? JSON.parse(snapshot.processes) : [], connections: snapshot ? JSON.parse(snapshot.connections) : [], installedApplications: snapshot ? JSON.parse(snapshot.installedApplications) : [], services, startupEntries: snapshot ? JSON.parse(snapshot.startupEntries) : [], securitySettings: snapshot ? JSON.parse(snapshot.securitySettings) : {} });
   }
 
   if (url.pathname === "/api/logout" && req.method === "POST") {
-    const raw=parseCookies(req.headers.cookie??"")[cookieName],session=verifySession(raw,config.sessionSecret);
+    const raw=parseCookies(req.headers.cookie??"")[cookieName(config)],session=verifySession(raw,config.sessionSecret);
     if(session)db.prepare("INSERT OR IGNORE INTO revoked_sessions(session_id,expires_at,revoked_at) VALUES(?,?,?)").run(session.jti,session.exp,new Date().toISOString());
     recordAudit(db, admin.email, "admin.logout", "administrator", "Administrator logged out.");
     clearCookie(res, config);
@@ -893,11 +1108,12 @@ async function route(req, res, db, config, loginAttempts) {
     const reportCutoff = new Date(Date.now() - reportDays * 86_400_000).toISOString();
     const deletedEvents = db.prepare("DELETE FROM events WHERE created_at < ?").run(cutoff).changes;
     const deletedGatewayMetrics = db.prepare("DELETE FROM gateway_request_metrics WHERE observed_at < ?").run(cutoff).changes;
+    const deletedGatewayOutbox = db.prepare("DELETE FROM gateway_event_outbox WHERE created_at < ?").run(cutoff).changes;
     const deletedReports = db.prepare("DELETE FROM incident_reports WHERE expires_at<=? OR created_at<?").run(new Date().toISOString(), reportCutoff).changes;
     const deletedAudit = db.prepare("DELETE FROM audit_log WHERE created_at < ?").run(cutoff).changes;
-    if(deletedEvents||deletedGatewayMetrics||deletedReports||deletedAudit)db.exec("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;");
-    recordAudit(db, admin.email, "retention.run", "local-data", `Deleted ${deletedEvents} event rows, ${deletedGatewayMetrics} gateway timing rows, ${deletedReports} report snapshots, and ${deletedAudit} audit rows; raw retention ${rawEventDays} days, report retention ${reportDays} days.`);
-    return json(res, 200, { deletedEvents, deletedGatewayMetrics, deletedReports, deletedAudit, cutoff, reportCutoff });
+    if(deletedEvents||deletedGatewayMetrics||deletedGatewayOutbox||deletedReports||deletedAudit)db.exec("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;");
+    recordAudit(db, admin.email, "retention.run", "local-data", `Deleted ${deletedEvents} event rows, ${deletedGatewayMetrics} gateway timing rows, ${deletedGatewayOutbox} queued gateway events, ${deletedReports} report snapshots, and ${deletedAudit} audit rows; raw retention ${rawEventDays} days, report retention ${reportDays} days.`);
+    return json(res, 200, { deletedEvents, deletedGatewayMetrics, deletedGatewayOutbox, deletedReports, deletedAudit, cutoff, reportCutoff });
   }
 
   if (url.pathname.startsWith("/api/")) {
@@ -930,7 +1146,7 @@ function setupRequired(db) {
 }
 
 function currentAdmin(req, db, config) {
-  const token = parseCookies(req.headers.cookie ?? "")[cookieName];
+  const token = parseCookies(req.headers.cookie ?? "")[cookieName(config)];
   const session = verifySession(token, config.sessionSecret);
   if (!session) {
     return null;
@@ -942,6 +1158,7 @@ function currentAdmin(req, db, config) {
 function queueDeviceConfig(db, device, createdAt) {
   const version = Number(device.config_version);
   const config = { collectProcesses: Boolean(device.collection_processes), collectConnections: Boolean(device.collection_connections),
+    collectApplications: Boolean(device.collection_applications), collectServices: Boolean(device.collection_services), collectStartup: Boolean(device.collection_startup), collectSecurity: Boolean(device.collection_security),
     intervalSeconds: device.collection_interval_seconds, outboundConnectionThreshold: device.outbound_connection_threshold, retainedDays: device.retained_days };
   db.prepare("INSERT INTO device_config_updates(device_id,version,config_json,status,created_at) VALUES(?,?,?,'pending',?) ON CONFLICT(device_id,version) DO UPDATE SET config_json=excluded.config_json")
     .run(device.device_id, version, JSON.stringify(config), createdAt);
@@ -1011,12 +1228,43 @@ function alertTitle(rule) {
 function tokenHash(token) { return crypto.createHash("sha256").update(token).digest("hex"); }
 function firewallRuleForAgent(rule) {
   const remove = ["removing", "expired", "removed"].includes(rule.status) || Date.parse(rule.expires_at) <= Date.now();
-  return { id: rule.id, name: `SentryGate-${rule.id}`, group: "SentryGate", status: rule.status, operation: remove ? "remove" : "ensure", remoteAddress: rule.remote_cidr, protocol: rule.protocol, localPort: rule.local_port, expiresAt: rule.expires_at };
+  return { id: rule.id, name: `SentryGate-${rule.id}`, group: "SentryGate", kind: "inbound", status: rule.status, operation: remove ? "remove" : "ensure", remoteAddress: rule.remote_cidr, protocol: rule.protocol, localPort: rule.local_port, expiresAt: rule.expires_at };
 }
 function firewallRuleForDashboard(rule) {
   return { id: rule.id, deviceId: rule.device_id, deviceName: rule.device_name ?? "", incidentId: rule.incident_id ?? null, remoteCidr: rule.remote_cidr, protocol: rule.protocol, localPort: rule.local_port, reason: rule.reason, evidence: rule.evidence, expiresAt: rule.expires_at, status: rule.status, createdBy: rule.created_by, createdAt: rule.created_at, approvedBy: rule.approved_by, approvedAt: rule.approved_at, appliedAt: rule.applied_at, actualState: rule.actual_state ? JSON.parse(rule.actual_state) : null, failure: rule.failure, rollbackAt: rule.rollback_at };
 }
-function deviceSettingsFor(device) { return { collectProcesses: Boolean(device.collection_processes), collectConnections: Boolean(device.collection_connections), intervalSeconds: device.collection_interval_seconds, outboundConnectionThreshold: device.outbound_connection_threshold, retainedDays: device.retained_days }; }
+function deviceSettingsFor(device) { return { collectProcesses: Boolean(device.collection_processes), collectConnections: Boolean(device.collection_connections), collectApplications: Boolean(device.collection_applications), collectServices: Boolean(device.collection_services), collectStartup: Boolean(device.collection_startup), collectSecurity: Boolean(device.collection_security), intervalSeconds: device.collection_interval_seconds, outboundConnectionThreshold: device.outbound_connection_threshold, retainedDays: device.retained_days }; }
+function applicationPolicyForAgent(policy) {
+  const remove = ["removing", "expired", "removed"].includes(policy.status) || Date.parse(policy.expires_at) <= Date.now();
+  return { id: policy.id, name: `SentryGate-App-${policy.id}`, group: "SentryGate", kind: "application", operation: remove ? "remove" : "ensure",
+    programPath: policy.program_path, policyMode: policy.mode, action: policy.mode === "allow" ? "Allow" : "Block", direction: "Inbound",
+    expiresAt: policy.expires_at, status: policy.status };
+}
+function applicationPolicyForDashboard(policy) {
+  return { id: policy.id, deviceId: policy.device_id, deviceName: policy.device_name ?? "", applicationName: policy.application_name,
+    programPath: policy.program_path, mode: policy.mode, reason: policy.reason, evidence: policy.evidence, expiresAt: policy.expires_at,
+    status: policy.status, createdBy: policy.created_by, createdAt: policy.created_at, approvedBy: policy.approved_by, approvedAt: policy.approved_at,
+    preview: JSON.parse(policy.preview_json), actualState: policy.actual_state ? JSON.parse(policy.actual_state) : null, failure: policy.failure, rollbackAt: policy.rollback_at };
+}
+function expireApplicationPolicies(db, now = new Date().toISOString()) {
+  const expired = db.prepare("SELECT id FROM application_network_policies WHERE status IN ('proposed','approved','active','failed','review') AND expires_at<=?").all(now);
+  for (const row of expired) {
+    db.prepare("UPDATE application_network_policies SET status='expired',updated_at=? WHERE id=?").run(now, row.id);
+    recordAudit(db, "system", "firewall.application_policy_expired", `application-policy:${row.id}`, "Policy expiry reached; authenticated device helper removal is queued.");
+  }
+}
+function validateApplicationPolicy(body, db, now = Date.now()) {
+  if (!body || typeof body !== "object") return "Application policy details are required";
+  if (typeof body.deviceId !== "string" || !/^[a-f0-9-]{36}$/i.test(body.deviceId)) return "Select a valid enrolled device";
+  if (typeof body.applicationName !== "string" || !body.applicationName.trim() || body.applicationName.length > 260) return "Application name is required (maximum 260 characters)";
+  if (typeof body.programPath !== "string" || body.programPath.length > 2048 || !path.win32.isAbsolute(body.programPath) || !/\.exe$/i.test(body.programPath) || /[\r\n\0"]/.test(body.programPath)) return "An absolute Windows executable path is required";
+  if (!["allow", "block", "review"].includes(body.mode)) return "Mode must be allow, block, or review";
+  if (typeof body.reason !== "string" || !body.reason.trim() || body.reason.length > 500 || typeof body.evidence !== "string" || !body.evidence.trim() || body.evidence.length > 2000) return "A reason and evidence (up to 2000 characters) are required";
+  if (!validDate(body.expiresAt) || Date.parse(body.expiresAt) <= now || Date.parse(body.expiresAt) > now + 365 * 86_400_000) return "Expiry must be in the future and within one year";
+  if (typeof body.idempotencyKey !== "string" || !/^[a-f0-9-]{36}$/i.test(body.idempotencyKey)) return "A UUID idempotency key is required";
+  if (!db.prepare("SELECT 1 FROM device_agents WHERE device_id=? AND revoked_at IS NULL AND is_demo=0").get(body.deviceId)) return "Select a non-demo enrolled device";
+  return null;
+}
 function safeTokenMatches(token, expectedHex) {
   if (typeof token !== "string" || token.length < 32 || token.length > 256) return false;
   const actual = Buffer.from(tokenHash(token), "hex");
@@ -1041,6 +1289,8 @@ function validateActionPolicy(body, db) {
   if (!Number.isInteger(body.minimumEventCount) || body.minimumEventCount < 2 || body.minimumEventCount > 100) return "Minimum event count must be from 2 to 100";
   if (!Number.isInteger(body.windowMinutes) || body.windowMinutes < 1 || body.windowMinutes > 1440) return "Policy window must be from 1 to 1440 minutes";
   if (!['device', 'website'].includes(body.targetType) || typeof body.targetId !== 'string' && typeof body.targetId !== 'number') return "Select a device or website destination";
+  if (!['observe','recommend','enforce'].includes(body.mode ?? 'observe')) return "Mode must be observe, recommend, or enforce";
+  if ((body.mode ?? 'observe') === 'enforce' && body.targetType !== 'device') return "Enforce mode is currently limited to an enrolled Windows computer";
   if (!Number.isInteger(body.durationMinutes) || body.durationMinutes < 1 || body.durationMinutes > 1440) return "Temporary action duration must be from 1 to 1440 minutes";
   if (body.targetType === "device") {
     const target = db.prepare("SELECT asset_id FROM device_agents WHERE device_id=? AND revoked_at IS NULL AND is_demo=0").get(String(body.targetId));
@@ -1055,7 +1305,7 @@ function validateActionPolicy(body, db) {
 }
 
 function actionPolicyForDashboard(policy) {
-  return { id: policy.id, name: policy.name, enabled: Boolean(policy.enabled), mode: "suggestion-only", assetId: policy.asset_id,
+  return { id: policy.id, name: policy.name, enabled: Boolean(policy.enabled), mode: policy.mode === "suggestion-only" ? "recommend" : policy.mode, assetId: policy.asset_id,
     assetName: policy.asset_name ?? "", detectionRule: policy.detection_rule, minimumSeverity: policy.minimum_severity,
     minimumEventCount: policy.minimum_event_count, windowMinutes: policy.window_minutes, targetType: policy.target_type,
     targetId: policy.target_id, protocol: policy.protocol, localPort: policy.local_port, durationMinutes: policy.duration_minutes,
@@ -1063,7 +1313,7 @@ function actionPolicyForDashboard(policy) {
 }
 
 function validateDeviceSettings(body) {
-  if (!body || typeof body.collectProcesses !== "boolean" || typeof body.collectConnections !== "boolean") return "Collection settings must be boolean";
+  if (!body || typeof body.collectProcesses !== "boolean" || typeof body.collectConnections !== "boolean" || ["collectApplications", "collectServices", "collectStartup", "collectSecurity"].some((key) => body[key] !== undefined && typeof body[key] !== "boolean")) return "Collection settings must be boolean";
   if (!Number.isInteger(body.intervalSeconds) || body.intervalSeconds < 10 || body.intervalSeconds > 3600) return "Interval must be 10 to 3600 seconds";
   if (!Number.isInteger(body.outboundConnectionThreshold) || body.outboundConnectionThreshold < 5 || body.outboundConnectionThreshold > 10000) return "Outbound threshold must be 5 to 10000";
   if (!Number.isInteger(body.retainedDays) || body.retainedDays < 1 || body.retainedDays > 3650) return "Retention must be 1 to 3650 days";
@@ -1078,10 +1328,16 @@ function validateDeviceReport(body, deviceId) {
   for (const [key, limit] of [["processes", 10000], ["connections", 20000], ["events", 200]]) {
     if (!Array.isArray(body[key]) || body[key].length > limit) return `${key} must contain no more than ${limit} records`;
   }
+  if (body.commandAckNonce !== undefined && (typeof body.commandAckNonce !== "string" || !/^[a-f0-9-]{36}$/i.test(body.commandAckNonce))) return "Invalid one-time command acknowledgement";
+  for (const [key, limit] of [["installedApplications", 5000], ["services", 5000], ["startupEntries", 2000]]) if (body[key] !== undefined && (!Array.isArray(body[key]) || body[key].length > limit)) return `Invalid ${key} inventory`;
   for (const field of ["hostname", "osVersion", "agentVersion"]) if (typeof body.device[field] !== "string" || body.device[field].length > 200) return `Invalid device ${field}`;
   for (const process of body.processes) {
-    if (!Number.isInteger(process.pid) || process.pid < 0 || typeof process.name !== "string" || process.name.length > 260) return "Invalid process metadata";
+    if (!Number.isInteger(process.pid) || process.pid < 0 || typeof process.name !== "string" || process.name.length > 260 || (process.executablePath !== undefined && (typeof process.executablePath !== "string" || process.executablePath.length > 2048))) return "Invalid process metadata";
   }
+  for (const app of body.installedApplications ?? []) if (typeof app.name !== "string" || app.name.length > 260 || [app.version,app.publisher,app.installLocation,app.installDate].some((v) => v !== undefined && (typeof v !== "string" || v.length > 2048))) return "Invalid installed application metadata";
+  for (const service of body.services ?? []) if (typeof service.name !== "string" || service.name.length > 260 || typeof service.state !== "string" || service.state.length > 30 || typeof service.startMode !== "string" || service.startMode.length > 30 || !Number.isInteger(service.processId)) return "Invalid service metadata";
+  for (const entry of body.startupEntries ?? []) if (typeof entry.name !== "string" || entry.name.length > 260 || typeof entry.executablePath !== "string" || entry.executablePath.length > 2048 || typeof entry.source !== "string" || entry.source.length > 500) return "Invalid startup metadata";
+  if (body.securitySettings !== undefined && (!body.securitySettings || typeof body.securitySettings !== "object" || !Array.isArray(body.securitySettings.firewallProfiles) || body.securitySettings.firewallProfiles.length > 10 || body.securitySettings.firewallProfiles.some((p) => typeof p.name !== "string" || p.name.length > 30 || typeof p.enabled !== "boolean") || body.securitySettings.defenderRealtimeProtection !== null && typeof body.securitySettings.defenderRealtimeProtection !== "boolean")) return "Invalid security setting metadata";
   for (const connection of body.connections) {
     if (!Number.isInteger(connection.pid) || typeof connection.state !== "string" || connection.state.length > 30 ||
         !Number.isInteger(connection.localPort) || connection.localPort < 0 || connection.localPort > 65535 ||
@@ -1131,12 +1387,12 @@ function empty(res, status) {
 
 function setCookie(res, token, config) {
   const secure = config.cookieSecure ? "; Secure" : "";
-  res.setHeader("Set-Cookie", `${cookieName}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800${secure}`);
+  res.setHeader("Set-Cookie", `${cookieName(config)}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800${secure}`);
 }
 
 function clearCookie(res, config) {
   const secure = config.cookieSecure ? "; Secure" : "";
-  res.setHeader("Set-Cookie", `${cookieName}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${secure}`);
+  res.setHeader("Set-Cookie", `${cookieName(config)}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${secure}`);
 }
 
 function databaseCapacityReached(config) {
@@ -1144,6 +1400,15 @@ function databaseCapacityReached(config) {
   if(total<config.maxDbBytes)return false;
   logOperational("error","storage.limit_reached",{bytes:total,limitBytes:config.maxDbBytes});
   return true;
+}
+
+function storageStatus(config,bytes) {
+  let freeBytes=null;
+  try { const stats=fs.statfsSync(config.dataDir??path.dirname(config.dbPath)); freeBytes=stats.bavail*stats.bsize; } catch { /* Filesystem free-space reporting is not available on every platform. */ }
+  const usedPercent=Math.min(100,Math.round(bytes/config.maxDbBytes*100));
+  const warningPercent=config.storageWarningPercent??80;
+  const lowDisk=freeBytes!==null&&config.minFreeDiskBytes>0&&freeBytes<=config.minFreeDiskBytes;
+  return { dataDirectory:path.resolve(config.dataDir??path.dirname(config.dbPath)), databasePath:path.resolve(config.dbPath), storageBytes:bytes, storageLimitBytes:config.maxDbBytes, storageUsedPercent:usedPercent, freeBytes, minimumFreeBytes:config.minFreeDiskBytes, warningPercent, warning:usedPercent>=warningPercent||bytes>=config.maxDbBytes||lowDisk, lowDisk, full:bytes>=config.maxDbBytes };
 }
 
 function sameRequestOrigin(origin,req){const parsed=new URL(origin),scheme=req.socket.encrypted?"https:":"http:";return parsed.protocol===scheme&&parsed.host===req.headers.host&&!parsed.username&&!parsed.password;}

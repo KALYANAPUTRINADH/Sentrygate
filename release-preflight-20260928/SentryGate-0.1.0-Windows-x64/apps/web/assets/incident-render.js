@@ -1,0 +1,5 @@
+import { escapeHtml } from "./escape.js";
+
+export function renderIncidentEvidence(event) {
+  return `<article class="incident-event"><time>${escapeHtml(event.timestamp)}</time><div><div class="incident-event-heading"><strong>${escapeHtml(event.source)} · ${escapeHtml(event.detectionRule)}</strong><span class="severity ${escapeHtml(event.severity)}">${escapeHtml(event.severity)}</span></div><p>${escapeHtml(event.reason)}</p><dl class="facts"><dt>Observed facts</dt><dd>${escapeHtml(event.evidence)}${event.responseStatus ? ` · response ${escapeHtml(event.responseStatus)}` : ""}</dd><dt>Action</dt><dd>${escapeHtml(event.action)}</dd><dt>Asset / device</dt><dd>${escapeHtml(event.assetName || "—")} / ${escapeHtml(event.deviceName || "—")}</dd>${event.path ? `<dt>Request path</dt><dd class="mono">${escapeHtml(event.path)}</dd>` : ""}${event.userAgent ? `<dt>User agent</dt><dd>${escapeHtml(event.userAgent)} <span class="subtle">(unverified client-supplied string)</span></dd>` : ""}${event.processDetails ? `<dt>Process details</dt><dd>${escapeHtml(event.processDetails)}</dd>` : ""}</dl></div></article>`;
+}
